@@ -1,0 +1,1309 @@
+use crate::core::automation::{clamp_automation_value, sort_lane_points};
+use crate::core::project::next_venture_name;
+use crate::core::state::{
+    ChasePhase, ClipEditorPhase, CuePhase, CueVisualState, EnginePhase, FixturePhase, HoverTarget,
+    MIN_CLIP_DURATION, SelectionState, SnapPhase, StateLifecycle, StudioState, TimelinePhase,
+    TimelineViewport,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ValidationIssueKind {
+    TypeConsistency,
+    StateConsistency,
+    Determinism,
+    ReferenceIntegrity,
+    TimingConsistency,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationIssue {
+    pub kind: ValidationIssueKind,
+    pub code: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationReport {
+    pub valid: bool,
+    pub issues: Vec<ValidationIssue>,
+    pub corrections: Vec<String>,
+}
+
+pub fn validate_state(state: &StudioState) -> ValidationReport {
+    let mut issues = Vec::new();
+    validate_ids(state, &mut issues);
+    validate_selection_and_hover(state, &mut issues);
+    validate_timeline_bounds(state, &mut issues);
+    validate_show_references(state, &mut issues);
+    validate_authoring_extensions(state, &mut issues);
+    validate_event_queue(state, &mut issues);
+    validate_phase_consistency(state, &mut issues);
+
+    ValidationReport {
+        valid: issues.is_empty(),
+        issues,
+        corrections: Vec::new(),
+    }
+}
+
+pub fn recover_state(state: &mut StudioState, report: &ValidationReport) -> ValidationReport {
+    let mut corrections = Vec::new();
+
+    for issue in &report.issues {
+        match issue.code.as_str() {
+            "selection.clip.missing" | "selection.track.missing" | "selection.clip_set.invalid" => {
+                state.timeline.selection = SelectionState::None;
+                state.timeline.selected_clips.clear();
+                corrections.push("selection reset".to_owned());
+            }
+            "selection.cue.missing" => {
+                state.cue_system.selected = None;
+                corrections.push("cue selection reset".to_owned());
+            }
+            "selection.chase.missing" => {
+                state.chase_system.selected = None;
+                state.chase_system.selected_step = None;
+                corrections.push("chase selection reset".to_owned());
+            }
+            "selection.chase.step.invalid" => {
+                state.chase_system.selected_step =
+                    state.chase_system.selected.and_then(|selected| {
+                        state
+                            .chase(selected)
+                            .and_then(|chase| (!chase.steps.is_empty()).then_some(0))
+                    });
+                corrections.push("chase step selection reset".to_owned());
+            }
+            "selection.fx.missing" => {
+                state.fx_system.selected = None;
+                corrections.push("fx selection reset".to_owned());
+            }
+            "selection.fixture.missing" => {
+                state.fixture_system.selected = None;
+                corrections.push("fixture selection reset".to_owned());
+            }
+            "clip_editor.clip.missing" | "clip_editor.selection.mismatch" => {
+                state.clip_editor.phase = ClipEditorPhase::Closed;
+                state.clip_editor.clip_id = None;
+                state.clip_editor.selected_automation_point = None;
+                corrections.push("clip editor closed".to_owned());
+            }
+            "clip_editor.automation_point.out_of_bounds" => {
+                state.clip_editor.selected_automation_point = None;
+                corrections.push("clip editor automation selection reset".to_owned());
+            }
+            "hover.clip.missing" => {
+                state.timeline.hover = None;
+                corrections.push("hover reset".to_owned());
+            }
+            "context_menu.target.missing" => {
+                state.context_menu.open = false;
+                state.context_menu.target = None;
+                corrections.push("context menu closed".to_owned());
+            }
+            "clipboard.track.missing" => {
+                state.clipboard = Default::default();
+                corrections.push("clipboard cleared".to_owned());
+            }
+            "replay_log.capacity.exceeded" => {
+                if state.replay_log.events.len() > state.replay_log.capacity {
+                    let overflow = state.replay_log.events.len() - state.replay_log.capacity;
+                    state.replay_log.events.drain(0..overflow);
+                }
+                corrections.push("replay log trimmed".to_owned());
+            }
+            "venture.selected.missing" => {
+                state.venture.selected = None;
+                if state.venture.draft_name.trim().is_empty() {
+                    state.venture.draft_name = next_venture_name(&state.venture.ventures);
+                }
+                corrections.push("venture selection reset".to_owned());
+            }
+            "venture.recovery.selected.missing" => {
+                state.venture.selected_recovery = None;
+                corrections.push("recovery selection reset".to_owned());
+            }
+            "snap.guide.out_of_bounds" => {
+                state.timeline.snap.guide = None;
+                state.timeline.snap.phase = SnapPhase::Free;
+                corrections.push("snap guide cleared".to_owned());
+            }
+            "timeline.scroll.out_of_bounds" => {
+                state.timeline.viewport = TimelineViewport {
+                    zoom: state.timeline.viewport.zoom,
+                    scroll: state
+                        .timeline
+                        .viewport
+                        .scroll
+                        .min(state.engine.transport.song_length),
+                };
+                corrections.push("timeline scroll clamped".to_owned());
+            }
+            "clip.duration.too_short" => {
+                for track in &mut state.timeline.tracks {
+                    for clip in &mut track.clips {
+                        if clip.duration < MIN_CLIP_DURATION {
+                            clip.duration = MIN_CLIP_DURATION;
+                        }
+                    }
+                }
+                corrections.push("clip durations clamped".to_owned());
+            }
+            "clip.end.out_of_bounds" => {
+                for track in &mut state.timeline.tracks {
+                    for clip in &mut track.clips {
+                        let clip_end = clip.start.saturating_add(clip.duration);
+                        if clip_end > state.engine.transport.song_length {
+                            clip.start = clip.start.min(
+                                state
+                                    .engine
+                                    .transport
+                                    .song_length
+                                    .saturating_sub(clip.duration),
+                            );
+                        }
+                    }
+                }
+                corrections.push("clip positions clamped".to_owned());
+            }
+            "clip.linked_cue.missing" => {
+                let valid_cues = state
+                    .cue_system
+                    .cues
+                    .iter()
+                    .map(|cue| cue.id.0)
+                    .collect::<HashSet<_>>();
+                for track in &mut state.timeline.tracks {
+                    for clip in &mut track.clips {
+                        let cue_exists = clip
+                            .linked_cue
+                            .map(|cue_id| valid_cues.contains(&cue_id.0))
+                            .unwrap_or(true);
+                        if !cue_exists {
+                            clip.linked_cue = None;
+                            clip.cue_state = CueVisualState::Inactive;
+                        }
+                    }
+                }
+                corrections.push("clip cue links cleared".to_owned());
+            }
+            "clip.automation.target.duplicate"
+            | "clip.automation.point.out_of_bounds"
+            | "clip.automation.value.out_of_bounds" => {
+                for track in &mut state.timeline.tracks {
+                    for clip in &mut track.clips {
+                        let mut seen = HashSet::new();
+                        clip.automation.retain(|lane| seen.insert(lane.target));
+                        for lane in &mut clip.automation {
+                            for point in &mut lane.points {
+                                point.offset = point.offset.min(clip.duration);
+                                point.value = clamp_automation_value(lane.target, point.value);
+                            }
+                            sort_lane_points(lane);
+                        }
+                    }
+                }
+                corrections.push("automation lanes clamped".to_owned());
+            }
+            "cue.linked_clip.missing" => {
+                let valid_clips = state
+                    .timeline
+                    .tracks
+                    .iter()
+                    .flat_map(|track| track.clips.iter())
+                    .map(|clip| clip.id.0)
+                    .collect::<HashSet<_>>();
+                for cue in &mut state.cue_system.cues {
+                    let clip_exists = cue
+                        .linked_clip
+                        .map(|clip_id| valid_clips.contains(&clip_id.0))
+                        .unwrap_or(true);
+                    if !clip_exists {
+                        cue.linked_clip = None;
+                    }
+                }
+                corrections.push("cue clip links cleared".to_owned());
+            }
+            "chase.linked_clip.missing" => {
+                let valid_clips = state
+                    .timeline
+                    .tracks
+                    .iter()
+                    .flat_map(|track| track.clips.iter())
+                    .map(|clip| clip.id.0)
+                    .collect::<HashSet<_>>();
+                for chase in &mut state.chase_system.chases {
+                    let clip_exists = chase
+                        .linked_clip
+                        .map(|clip_id| valid_clips.contains(&clip_id.0))
+                        .unwrap_or(true);
+                    if !clip_exists {
+                        chase.linked_clip = None;
+                    }
+                }
+                corrections.push("chase clip links cleared".to_owned());
+            }
+            "chase.step.cue.missing" => {
+                let valid_cues = state
+                    .cue_system
+                    .cues
+                    .iter()
+                    .map(|cue| cue.id.0)
+                    .collect::<HashSet<_>>();
+                for chase in &mut state.chase_system.chases {
+                    for step in &mut chase.steps {
+                        let cue_exists = step
+                            .cue_id
+                            .map(|cue_id| valid_cues.contains(&cue_id.0))
+                            .unwrap_or(true);
+                        if !cue_exists {
+                            step.cue_id = None;
+                        }
+                    }
+                }
+                corrections.push("chase cue links cleared".to_owned());
+            }
+            "cue.active.invalid" => {
+                state.cue_system.active = state
+                    .cue_system
+                    .cues
+                    .iter()
+                    .find(|cue| matches!(cue.phase, CuePhase::Triggered | CuePhase::Active))
+                    .map(|cue| cue.id);
+                corrections.push("active cue recomputed".to_owned());
+            }
+            "chase.step.out_of_bounds" => {
+                for chase in &mut state.chase_system.chases {
+                    if chase.steps.is_empty() {
+                        chase.current_step = 0;
+                        chase.phase = ChasePhase::Stopped;
+                    } else {
+                        chase.current_step = chase.current_step.min(chase.steps.len() - 1);
+                    }
+                }
+                corrections.push("chase step indices clamped".to_owned());
+            }
+            "chase.step.duration.zero" => {
+                for chase in &mut state.chase_system.chases {
+                    for step in &mut chase.steps {
+                        step.duration = step.duration.max(MIN_CLIP_DURATION);
+                    }
+                }
+                corrections.push("chase step durations clamped".to_owned());
+            }
+            "fx.linked_clip.missing" => {
+                let valid_clips = state
+                    .timeline
+                    .tracks
+                    .iter()
+                    .flat_map(|track| track.clips.iter())
+                    .map(|clip| clip.id.0)
+                    .collect::<HashSet<_>>();
+                for layer in &mut state.fx_system.layers {
+                    let clip_exists = layer
+                        .linked_clip
+                        .map(|clip_id| valid_clips.contains(&clip_id.0))
+                        .unwrap_or(true);
+                    if !clip_exists {
+                        layer.linked_clip = None;
+                    }
+                }
+                corrections.push("fx clip links cleared".to_owned());
+            }
+            "fx.depth.out_of_bounds" => {
+                for layer in &mut state.fx_system.layers {
+                    layer.depth_permille = layer.depth_permille.min(1000);
+                }
+                corrections.push("fx depth clamped".to_owned());
+            }
+            "fx.spread.out_of_bounds" => {
+                for layer in &mut state.fx_system.layers {
+                    layer.spread_permille = layer.spread_permille.min(1000);
+                }
+                corrections.push("fx spread clamped".to_owned());
+            }
+            "fx.phase_offset.out_of_bounds" => {
+                for layer in &mut state.fx_system.layers {
+                    layer.phase_offset_permille = layer.phase_offset_permille.min(1000);
+                }
+                corrections.push("fx phase offset clamped".to_owned());
+            }
+            "fx.output.out_of_bounds" => {
+                for layer in &mut state.fx_system.layers {
+                    layer.output_level = layer.output_level.min(1000);
+                }
+                corrections.push("fx output clamped".to_owned());
+            }
+            "fixture.online.exceeds_count" => {
+                for group in &mut state.fixture_system.groups {
+                    group.online = group.online.min(group.fixture_count);
+                }
+                corrections.push("fixture online counts clamped".to_owned());
+            }
+            "fixture.linked_cue.missing" => {
+                let valid_cues = state
+                    .cue_system
+                    .cues
+                    .iter()
+                    .map(|cue| cue.id.0)
+                    .collect::<HashSet<_>>();
+                for group in &mut state.fixture_system.groups {
+                    let cue_exists = group
+                        .linked_cue
+                        .map(|cue_id| valid_cues.contains(&cue_id.0))
+                        .unwrap_or(true);
+                    if !cue_exists {
+                        group.linked_cue = None;
+                    }
+                }
+                corrections.push("fixture cue links cleared".to_owned());
+            }
+            "fixture.linked_fx.missing" => {
+                let valid_fx = state
+                    .fx_system
+                    .layers
+                    .iter()
+                    .map(|layer| layer.id.0)
+                    .collect::<HashSet<_>>();
+                for group in &mut state.fixture_system.groups {
+                    let fx_exists = group
+                        .linked_fx
+                        .map(|fx_id| valid_fx.contains(&fx_id.0))
+                        .unwrap_or(true);
+                    if !fx_exists {
+                        group.linked_fx = None;
+                    }
+                }
+                corrections.push("fixture fx links cleared".to_owned());
+            }
+            "fixture.output.out_of_bounds" => {
+                for group in &mut state.fixture_system.groups {
+                    group.output_level = group.output_level.min(1000);
+                }
+                corrections.push("fixture output clamped".to_owned());
+            }
+            "fixture.preview_node.out_of_bounds" => {
+                for group in &mut state.fixture_system.groups {
+                    for node in &mut group.preview_nodes {
+                        node.x_permille = node.x_permille.min(1000);
+                        node.y_permille = node.y_permille.min(1000);
+                        node.z_permille = node.z_permille.min(1000);
+                    }
+                }
+                corrections.push("fixture preview nodes clamped".to_owned());
+            }
+            "fixture.uninitialized.with_online" => {
+                for group in &mut state.fixture_system.groups {
+                    if group.phase == FixturePhase::Uninitialized && group.online > 0 {
+                        group.phase = FixturePhase::Mapped;
+                    }
+                }
+                corrections.push("fixture phase corrected".to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    let mut post = validate_state(state);
+    post.corrections = corrections;
+    post
+}
+
+fn validate_authoring_extensions(state: &StudioState, issues: &mut Vec<ValidationIssue>) {
+    for track in &state.timeline.tracks {
+        for clip in &track.clips {
+            let mut targets = HashSet::new();
+
+            for lane in &clip.automation {
+                if !targets.insert(lane.target) {
+                    issues.push(issue(
+                        ValidationIssueKind::ReferenceIntegrity,
+                        "clip.automation.target.duplicate",
+                        format!("Clip {} enthält doppelte Automation-Lanes.", clip.id.0),
+                    ));
+                }
+
+                for point in &lane.points {
+                    if point.offset > clip.duration {
+                        issues.push(issue(
+                            ValidationIssueKind::StateConsistency,
+                            "clip.automation.point.out_of_bounds",
+                            format!(
+                                "Automation-Punkt in Clip {} liegt ausserhalb der Clip-Dauer.",
+                                clip.id.0
+                            ),
+                        ));
+                    }
+
+                    if point.value != clamp_automation_value(lane.target, point.value) {
+                        issues.push(issue(
+                            ValidationIssueKind::TypeConsistency,
+                            "clip.automation.value.out_of_bounds",
+                            format!(
+                                "Automation-Wert in Clip {} verletzt die Range von {:?}.",
+                                clip.id.0, lane.target
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(target) = state.context_menu.target {
+        let valid = match target {
+            crate::core::ContextMenuTarget::Clip(clip_id) => state.clip(clip_id).is_some(),
+            crate::core::ContextMenuTarget::Track(track_id) => state.track(track_id).is_some(),
+            crate::core::ContextMenuTarget::Timeline => true,
+        };
+
+        if !valid {
+            issues.push(issue(
+                ValidationIssueKind::ReferenceIntegrity,
+                "context_menu.target.missing",
+                "Das Kontextmenü referenziert ein nicht existentes Ziel.".to_owned(),
+            ));
+        }
+    }
+
+    if state
+        .clipboard
+        .clips
+        .iter()
+        .any(|entry| state.track(entry.track_id).is_none())
+    {
+        issues.push(issue(
+            ValidationIssueKind::ReferenceIntegrity,
+            "clipboard.track.missing",
+            "Das Clipboard referenziert einen nicht existenten Track.".to_owned(),
+        ));
+    }
+
+    if let Some(index) = state.clip_editor.selected_automation_point
+        && let Some(clip) = state.editor_clip()
+    {
+        let lane = clip
+            .automation
+            .iter()
+            .find(|lane| lane.target == state.clip_editor.automation_target);
+        let valid = lane.map(|lane| index < lane.points.len()).unwrap_or(false);
+        if !valid {
+            issues.push(issue(
+                ValidationIssueKind::StateConsistency,
+                "clip_editor.automation_point.out_of_bounds",
+                "Der Clip-Editor selektiert einen nicht existenten Automation-Punkt.".to_owned(),
+            ));
+        }
+    }
+
+    if state.replay_log.events.len() > state.replay_log.capacity {
+        issues.push(issue(
+            ValidationIssueKind::Determinism,
+            "replay_log.capacity.exceeded",
+            "Der Replay-Log überschreitet seine feste Kapazität.".to_owned(),
+        ));
+    }
+
+    if let Some(selected) = state.venture.selected.as_deref()
+        && state
+            .venture
+            .ventures
+            .iter()
+            .all(|venture| venture.id != selected)
+    {
+        issues.push(issue(
+            ValidationIssueKind::ReferenceIntegrity,
+            "venture.selected.missing",
+            format!(
+                "Das selektierte Venture {} fehlt im Registry-State.",
+                selected
+            ),
+        ));
+    }
+
+    if let Some(selected) = state.venture.selected_recovery.as_deref()
+        && state
+            .venture
+            .recovery_slots
+            .iter()
+            .all(|slot| slot.id != selected)
+    {
+        issues.push(issue(
+            ValidationIssueKind::ReferenceIntegrity,
+            "venture.recovery.selected.missing",
+            format!(
+                "Der selektierte Recovery-Slot {} fehlt im Recovery-Registry-State.",
+                selected
+            ),
+        ));
+    }
+}
+
+fn validate_ids(state: &StudioState, issues: &mut Vec<ValidationIssue>) {
+    let mut track_ids = HashSet::new();
+    let mut clip_ids = HashSet::new();
+    let mut cue_ids = HashSet::new();
+    let mut chase_ids = HashSet::new();
+    let mut fx_ids = HashSet::new();
+    let mut fixture_ids = HashSet::new();
+
+    for track in &state.timeline.tracks {
+        if !track_ids.insert(track.id.0) {
+            issues.push(issue(
+                ValidationIssueKind::ReferenceIntegrity,
+                "track.id.duplicate",
+                format!("TrackId {} ist nicht eindeutig.", track.id.0),
+            ));
+        }
+
+        for clip in &track.clips {
+            if !clip_ids.insert(clip.id.0) {
+                issues.push(issue(
+                    ValidationIssueKind::ReferenceIntegrity,
+                    "clip.id.duplicate",
+                    format!("ClipId {} ist nicht eindeutig.", clip.id.0),
+                ));
+            }
+        }
+    }
+
+    for cue in &state.cue_system.cues {
+        if !cue_ids.insert(cue.id.0) {
+            issues.push(issue(
+                ValidationIssueKind::ReferenceIntegrity,
+                "cue.id.duplicate",
+                format!("CueId {} ist nicht eindeutig.", cue.id.0),
+            ));
+        }
+    }
+
+    for chase in &state.chase_system.chases {
+        if !chase_ids.insert(chase.id.0) {
+            issues.push(issue(
+                ValidationIssueKind::ReferenceIntegrity,
+                "chase.id.duplicate",
+                format!("ChaseId {} ist nicht eindeutig.", chase.id.0),
+            ));
+        }
+    }
+
+    for layer in &state.fx_system.layers {
+        if !fx_ids.insert(layer.id.0) {
+            issues.push(issue(
+                ValidationIssueKind::ReferenceIntegrity,
+                "fx.id.duplicate",
+                format!("FxId {} ist nicht eindeutig.", layer.id.0),
+            ));
+        }
+    }
+
+    for group in &state.fixture_system.groups {
+        if !fixture_ids.insert(group.id.0) {
+            issues.push(issue(
+                ValidationIssueKind::ReferenceIntegrity,
+                "fixture.id.duplicate",
+                format!("FixtureGroupId {} ist nicht eindeutig.", group.id.0),
+            ));
+        }
+    }
+}
+
+fn validate_selection_and_hover(state: &StudioState, issues: &mut Vec<ValidationIssue>) {
+    match state.timeline.selection {
+        SelectionState::Clip(clip_id) => {
+            if state.clip(clip_id).is_none() {
+                issues.push(issue(
+                    ValidationIssueKind::ReferenceIntegrity,
+                    "selection.clip.missing",
+                    format!("Selektierter Clip {} existiert nicht.", clip_id.0),
+                ));
+            }
+
+            let mut ids = HashSet::new();
+            let clips_valid = !state.timeline.selected_clips.is_empty()
+                && state.timeline.selected_clips.contains(&clip_id)
+                && state
+                    .timeline
+                    .selected_clips
+                    .iter()
+                    .all(|clip_id| ids.insert(clip_id.0) && state.clip(*clip_id).is_some());
+
+            if !clips_valid {
+                issues.push(issue(
+                    ValidationIssueKind::StateConsistency,
+                    "selection.clip_set.invalid",
+                    "Clip-Selektion ist leer, dupliziert oder referenziert ungültige Clips."
+                        .to_owned(),
+                ));
+            }
+        }
+        SelectionState::Track(track_id) if state.track(track_id).is_none() => issues.push(issue(
+            ValidationIssueKind::ReferenceIntegrity,
+            "selection.track.missing",
+            format!("Selektierter Track {} existiert nicht.", track_id.0),
+        )),
+        SelectionState::Track(_) => {
+            if !state.timeline.selected_clips.is_empty() {
+                issues.push(issue(
+                    ValidationIssueKind::StateConsistency,
+                    "selection.clip_set.invalid",
+                    "Track-Selektion darf keine Clip-Mengen führen.".to_owned(),
+                ));
+            }
+        }
+        SelectionState::None => {
+            if !state.timeline.selected_clips.is_empty() {
+                issues.push(issue(
+                    ValidationIssueKind::StateConsistency,
+                    "selection.clip_set.invalid",
+                    "Leere Selektion darf keine Clip-Mengen führen.".to_owned(),
+                ));
+            }
+        }
+    }
+
+    match state.timeline.hover {
+        Some(HoverTarget::ClipBody(clip_id))
+        | Some(HoverTarget::ClipStartHandle(clip_id))
+        | Some(HoverTarget::ClipEndHandle(clip_id))
+            if state.clip(clip_id).is_none() =>
+        {
+            issues.push(issue(
+                ValidationIssueKind::ReferenceIntegrity,
+                "hover.clip.missing",
+                format!("Hover-Clip {} existiert nicht.", clip_id.0),
+            ));
+        }
+        _ => {}
+    }
+
+    if let Some(cue_id) = state.cue_system.selected
+        && state.cue(cue_id).is_none()
+    {
+        issues.push(issue(
+            ValidationIssueKind::ReferenceIntegrity,
+            "selection.cue.missing",
+            format!("Selektierter Cue {} existiert nicht.", cue_id.0),
+        ));
+    }
+
+    if let Some(chase_id) = state.chase_system.selected
+        && state.chase(chase_id).is_none()
+    {
+        issues.push(issue(
+            ValidationIssueKind::ReferenceIntegrity,
+            "selection.chase.missing",
+            format!("Selektierter Chase {} existiert nicht.", chase_id.0),
+        ));
+    }
+
+    if let Some(selected_step) = state.chase_system.selected_step {
+        let valid = state
+            .selected_chase()
+            .map(|chase| selected_step < chase.steps.len())
+            .unwrap_or(false);
+        if !valid {
+            issues.push(issue(
+                ValidationIssueKind::StateConsistency,
+                "selection.chase.step.invalid",
+                format!("Selektierter Chase-Step {} ist ungueltig.", selected_step),
+            ));
+        }
+    }
+
+    if let Some(fx_id) = state.fx_system.selected
+        && state.fx_layer(fx_id).is_none()
+    {
+        issues.push(issue(
+            ValidationIssueKind::ReferenceIntegrity,
+            "selection.fx.missing",
+            format!("Selektierter FX-Layer {} existiert nicht.", fx_id.0),
+        ));
+    }
+
+    if let Some(group_id) = state.fixture_system.selected
+        && state.fixture_group(group_id).is_none()
+    {
+        issues.push(issue(
+            ValidationIssueKind::ReferenceIntegrity,
+            "selection.fixture.missing",
+            format!("Selektierte Fixture-Gruppe {} existiert nicht.", group_id.0),
+        ));
+    }
+
+    if state.clip_editor.phase != ClipEditorPhase::Closed {
+        match state.clip_editor.clip_id {
+            Some(clip_id) if state.clip(clip_id).is_none() => issues.push(issue(
+                ValidationIssueKind::ReferenceIntegrity,
+                "clip_editor.clip.missing",
+                format!("Clip-Editor referenziert unbekannten Clip {}.", clip_id.0),
+            )),
+            Some(clip_id)
+                if state.timeline.selection != SelectionState::Clip(clip_id)
+                    || state.timeline.selected_clips != vec![clip_id] =>
+            {
+                issues.push(issue(
+                    ValidationIssueKind::StateConsistency,
+                    "clip_editor.selection.mismatch",
+                    format!(
+                        "Clip-Editor für Clip {} ist offen, Selection zeigt auf etwas anderes.",
+                        clip_id.0
+                    ),
+                ));
+            }
+            Some(_) => {}
+            None => issues.push(issue(
+                ValidationIssueKind::StateConsistency,
+                "clip_editor.clip.missing",
+                "Clip-Editor ist offen, aber ohne ClipId.".to_owned(),
+            )),
+        }
+    }
+}
+
+fn validate_timeline_bounds(state: &StudioState, issues: &mut Vec<ValidationIssue>) {
+    if state.timeline.viewport.scroll > state.engine.transport.song_length {
+        issues.push(issue(
+            ValidationIssueKind::StateConsistency,
+            "timeline.scroll.out_of_bounds",
+            "Timeline-Scroll liegt hinter der Songlänge.".to_owned(),
+        ));
+    }
+
+    if let Some(guide) = &state.timeline.snap.guide
+        && guide.beat > state.engine.transport.song_length
+    {
+        issues.push(issue(
+            ValidationIssueKind::StateConsistency,
+            "snap.guide.out_of_bounds",
+            "Snap-Guide liegt außerhalb des Songs.".to_owned(),
+        ));
+    }
+
+    for track in &state.timeline.tracks {
+        for clip in &track.clips {
+            if clip.duration < MIN_CLIP_DURATION {
+                issues.push(issue(
+                    ValidationIssueKind::TypeConsistency,
+                    "clip.duration.too_short",
+                    format!("Clip {} ist kürzer als das Minimum.", clip.id.0),
+                ));
+            }
+
+            if clip.start.saturating_add(clip.duration) > state.engine.transport.song_length {
+                issues.push(issue(
+                    ValidationIssueKind::StateConsistency,
+                    "clip.end.out_of_bounds",
+                    format!("Clip {} endet hinter der Songlänge.", clip.id.0),
+                ));
+            }
+        }
+    }
+}
+
+fn validate_show_references(state: &StudioState, issues: &mut Vec<ValidationIssue>) {
+    for track in &state.timeline.tracks {
+        for clip in &track.clips {
+            if let Some(cue_id) = clip.linked_cue
+                && state.cue(cue_id).is_none()
+            {
+                issues.push(issue(
+                    ValidationIssueKind::ReferenceIntegrity,
+                    "clip.linked_cue.missing",
+                    format!(
+                        "Clip {} referenziert unbekannten Cue {}.",
+                        clip.id.0, cue_id.0
+                    ),
+                ));
+            }
+        }
+    }
+
+    for cue in &state.cue_system.cues {
+        if let Some(clip_id) = cue.linked_clip
+            && state.clip(clip_id).is_none()
+        {
+            issues.push(issue(
+                ValidationIssueKind::ReferenceIntegrity,
+                "cue.linked_clip.missing",
+                format!(
+                    "Cue {} referenziert unbekannten Clip {}.",
+                    cue.id.0, clip_id.0
+                ),
+            ));
+        }
+    }
+
+    if let Some(active_cue_id) = state.cue_system.active {
+        match state.cue(active_cue_id) {
+            Some(cue)
+                if !matches!(
+                    cue.phase,
+                    CuePhase::Triggered | CuePhase::Fading | CuePhase::Active
+                ) =>
+            {
+                issues.push(issue(
+                    ValidationIssueKind::StateConsistency,
+                    "cue.active.invalid",
+                    format!("Aktiver Cue {} ist nicht aktiv genug.", active_cue_id.0),
+                ));
+            }
+            None => issues.push(issue(
+                ValidationIssueKind::ReferenceIntegrity,
+                "cue.active.invalid",
+                format!("Aktiver Cue {} existiert nicht.", active_cue_id.0),
+            )),
+            Some(_) => {}
+        }
+    }
+
+    for chase in &state.chase_system.chases {
+        if chase.steps.is_empty() || chase.current_step >= chase.steps.len() {
+            issues.push(issue(
+                ValidationIssueKind::StateConsistency,
+                "chase.step.out_of_bounds",
+                format!("Chase {} hat einen ungültigen Step-Index.", chase.id.0),
+            ));
+        }
+
+        if let Some(clip_id) = chase.linked_clip
+            && state.clip(clip_id).is_none()
+        {
+            issues.push(issue(
+                ValidationIssueKind::ReferenceIntegrity,
+                "chase.linked_clip.missing",
+                format!(
+                    "Chase {} referenziert unbekannten Clip {}.",
+                    chase.id.0, clip_id.0
+                ),
+            ));
+        }
+
+        for step in &chase.steps {
+            if let Some(cue_id) = step.cue_id
+                && state.cue(cue_id).is_none()
+            {
+                issues.push(issue(
+                    ValidationIssueKind::ReferenceIntegrity,
+                    "chase.step.cue.missing",
+                    format!(
+                        "Chase {} referenziert unbekannten Cue {}.",
+                        chase.id.0, cue_id.0
+                    ),
+                ));
+            }
+
+            if step.duration < MIN_CLIP_DURATION {
+                issues.push(issue(
+                    ValidationIssueKind::TimingConsistency,
+                    "chase.step.duration.zero",
+                    format!(
+                        "Chase {} enthaelt einen Step mit zu kurzer Dauer ({} Ticks).",
+                        chase.id.0,
+                        step.duration.ticks()
+                    ),
+                ));
+            }
+        }
+    }
+
+    for layer in &state.fx_system.layers {
+        if let Some(clip_id) = layer.linked_clip
+            && state.clip(clip_id).is_none()
+        {
+            issues.push(issue(
+                ValidationIssueKind::ReferenceIntegrity,
+                "fx.linked_clip.missing",
+                format!(
+                    "FX {} referenziert unbekannten Clip {}.",
+                    layer.id.0, clip_id.0
+                ),
+            ));
+        }
+
+        if layer.depth_permille > 1000 {
+            issues.push(issue(
+                ValidationIssueKind::TypeConsistency,
+                "fx.depth.out_of_bounds",
+                format!(
+                    "FX {} hat Depth {} > 1000.",
+                    layer.id.0, layer.depth_permille
+                ),
+            ));
+        }
+
+        if layer.spread_permille > 1000 {
+            issues.push(issue(
+                ValidationIssueKind::TypeConsistency,
+                "fx.spread.out_of_bounds",
+                format!(
+                    "FX {} hat Spread {} > 1000.",
+                    layer.id.0, layer.spread_permille
+                ),
+            ));
+        }
+
+        if layer.phase_offset_permille > 1000 {
+            issues.push(issue(
+                ValidationIssueKind::TypeConsistency,
+                "fx.phase_offset.out_of_bounds",
+                format!(
+                    "FX {} hat Phase Offset {} > 1000.",
+                    layer.id.0, layer.phase_offset_permille
+                ),
+            ));
+        }
+
+        if layer.output_level > 1000 {
+            issues.push(issue(
+                ValidationIssueKind::StateConsistency,
+                "fx.output.out_of_bounds",
+                format!(
+                    "FX {} hat Output {} > 1000.",
+                    layer.id.0, layer.output_level
+                ),
+            ));
+        }
+    }
+
+    for group in &state.fixture_system.groups {
+        if let Some(cue_id) = group.linked_cue
+            && state.cue(cue_id).is_none()
+        {
+            issues.push(issue(
+                ValidationIssueKind::ReferenceIntegrity,
+                "fixture.linked_cue.missing",
+                format!(
+                    "Fixture-Gruppe {} referenziert unbekannten Cue {}.",
+                    group.id.0, cue_id.0
+                ),
+            ));
+        }
+
+        if let Some(fx_id) = group.linked_fx
+            && state.fx_layer(fx_id).is_none()
+        {
+            issues.push(issue(
+                ValidationIssueKind::ReferenceIntegrity,
+                "fixture.linked_fx.missing",
+                format!(
+                    "Fixture-Gruppe {} referenziert unbekannten FX {}.",
+                    group.id.0, fx_id.0
+                ),
+            ));
+        }
+
+        if group.online > group.fixture_count {
+            issues.push(issue(
+                ValidationIssueKind::StateConsistency,
+                "fixture.online.exceeds_count",
+                format!(
+                    "Fixture-Gruppe {} meldet {} online bei {} Geräten.",
+                    group.id.0, group.online, group.fixture_count
+                ),
+            ));
+        }
+
+        if group.output_level > 1000 {
+            issues.push(issue(
+                ValidationIssueKind::StateConsistency,
+                "fixture.output.out_of_bounds",
+                format!(
+                    "Fixture-Gruppe {} hat Output {} > 1000.",
+                    group.id.0, group.output_level
+                ),
+            ));
+        }
+
+        for node in &group.preview_nodes {
+            if node.x_permille > 1000 || node.y_permille > 1000 || node.z_permille > 1000 {
+                issues.push(issue(
+                    ValidationIssueKind::TypeConsistency,
+                    "fixture.preview_node.out_of_bounds",
+                    format!(
+                        "Fixture-Gruppe {} enthält Preview-Node {} außerhalb 0..=1000.",
+                        group.id.0, node.label
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+fn validate_event_queue(state: &StudioState, issues: &mut Vec<ValidationIssue>) {
+    let mut last = 0u64;
+    for queued in &state.event_queue.queue {
+        if queued.sequence <= last {
+            issues.push(issue(
+                ValidationIssueKind::Determinism,
+                "event.sequence.order",
+                "Die Event-Reihenfolge ist nicht streng monoton.".to_owned(),
+            ));
+        }
+        last = queued.sequence;
+    }
+}
+
+fn validate_phase_consistency(state: &StudioState, issues: &mut Vec<ValidationIssue>) {
+    if state.engine.clock.frame_interval_ns == 0 {
+        issues.push(issue(
+            ValidationIssueKind::TimingConsistency,
+            "clock.interval.zero",
+            "Die monotone Clock hat kein gültiges Frame-Intervall.".to_owned(),
+        ));
+    }
+
+    if state.lifecycle == StateLifecycle::Invalid && state.engine.phase != EnginePhase::Error {
+        issues.push(issue(
+            ValidationIssueKind::StateConsistency,
+            "lifecycle.invalid.without_engine_error",
+            "Invalid-State ohne Engine-Fehlerzustand.".to_owned(),
+        ));
+    }
+
+    if state.timeline.phase == TimelinePhase::Snapping
+        && state.timeline.snap.phase == SnapPhase::Free
+    {
+        issues.push(issue(
+            ValidationIssueKind::StateConsistency,
+            "timeline.snapping.without_snap_phase",
+            "Timeline ist in Snapping, Snap-FSM aber nicht.".to_owned(),
+        ));
+    }
+
+    for group in &state.fixture_system.groups {
+        if group.phase == FixturePhase::Uninitialized && group.online > 0 {
+            issues.push(issue(
+                ValidationIssueKind::StateConsistency,
+                "fixture.uninitialized.with_online",
+                format!(
+                    "Fixture-Gruppe {} ist uninitialisiert, meldet aber {} Online-Geräte.",
+                    group.id.0, group.online
+                ),
+            ));
+        }
+    }
+}
+
+fn issue(kind: ValidationIssueKind, code: &str, detail: String) -> ValidationIssue {
+    ValidationIssue {
+        kind,
+        code: code.to_owned(),
+        detail,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{BeatTime, ClipId, CueId, FixtureGroupId, SelectionState, StudioState};
+
+    #[test]
+    fn validation_detects_missing_selected_clip() {
+        let mut state = StudioState::default();
+        state.timeline.selection = SelectionState::Clip(ClipId(9999));
+        state.timeline.selected_clips = vec![ClipId(9999)];
+
+        let report = validate_state(&state);
+        assert!(!report.valid);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "selection.clip.missing")
+        );
+    }
+
+    #[test]
+    fn recovery_clears_invalid_selection() {
+        let mut state = StudioState::default();
+        state.timeline.selection = SelectionState::Clip(ClipId(9999));
+        state.timeline.selected_clips = vec![ClipId(9999)];
+
+        let report = validate_state(&state);
+        let recovered = recover_state(&mut state, &report);
+
+        assert!(recovered.valid);
+        assert_eq!(state.timeline.selection, SelectionState::None);
+        assert!(state.timeline.selected_clips.is_empty());
+    }
+
+    #[test]
+    fn recovery_clamps_fx_and_fixture_ranges() {
+        let mut state = StudioState::default();
+        state.fx_system.layers[0].depth_permille = 1400;
+        state.fx_system.layers[0].output_level = 1600;
+        state.fixture_system.groups[0].online = 32;
+        state.fixture_system.groups[0].output_level = 1500;
+
+        let report = validate_state(&state);
+        let recovered = recover_state(&mut state, &report);
+
+        assert!(recovered.valid);
+        assert_eq!(state.fx_system.layers[0].depth_permille, 1000);
+        assert_eq!(state.fx_system.layers[0].output_level, 1000);
+        assert_eq!(
+            state
+                .fixture_group(FixtureGroupId(1))
+                .expect("fixture exists")
+                .online,
+            16
+        );
+        assert_eq!(
+            state
+                .fixture_group(FixtureGroupId(1))
+                .expect("fixture exists")
+                .output_level,
+            1000
+        );
+    }
+
+    #[test]
+    fn recovery_clamps_fx_preview_and_fixture_preview_ranges() {
+        let mut state = StudioState::default();
+        state.fx_system.layers[0].spread_permille = 1400;
+        state.fx_system.layers[0].phase_offset_permille = 1700;
+        state.fixture_system.groups[0].preview_nodes[0].x_permille = 1300;
+        state.fixture_system.groups[0].preview_nodes[0].y_permille = 1200;
+        state.fixture_system.groups[0].preview_nodes[0].z_permille = 1900;
+
+        let report = validate_state(&state);
+        let recovered = recover_state(&mut state, &report);
+
+        assert!(recovered.valid);
+        assert_eq!(state.fx_system.layers[0].spread_permille, 1000);
+        assert_eq!(state.fx_system.layers[0].phase_offset_permille, 1000);
+        assert_eq!(
+            state.fixture_system.groups[0].preview_nodes[0].x_permille,
+            1000
+        );
+        assert_eq!(
+            state.fixture_system.groups[0].preview_nodes[0].y_permille,
+            1000
+        );
+        assert_eq!(
+            state.fixture_system.groups[0].preview_nodes[0].z_permille,
+            1000
+        );
+    }
+
+    #[test]
+    fn validation_detects_missing_clip_cue_reference() {
+        let mut state = StudioState::default();
+        state.timeline.tracks[0].clips[0].linked_cue = Some(CueId(9999));
+
+        let report = validate_state(&state);
+
+        assert!(!report.valid);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "clip.linked_cue.missing")
+        );
+    }
+
+    #[test]
+    fn recovery_clamps_automation_lane_ranges() {
+        let mut state = StudioState::default();
+        state.timeline.tracks[0].clips[0].automation[0].points[0].value = 1400;
+        state.timeline.tracks[0].clips[0].automation[1].points[0].value = 40;
+        state.timeline.tracks[0].clips[0].automation[0].points[0].offset = BeatTime::from_beats(32);
+
+        let report = validate_state(&state);
+        let recovered = recover_state(&mut state, &report);
+
+        assert!(recovered.valid);
+        assert!(
+            state.timeline.tracks[0].clips[0].automation[0]
+                .points
+                .iter()
+                .any(|point| point.value == 1000)
+        );
+        assert!(
+            state.timeline.tracks[0].clips[0].automation[1]
+                .points
+                .iter()
+                .any(|point| point.value == 200)
+        );
+        assert!(
+            state.timeline.tracks[0].clips[0].automation[0].points[0].offset
+                <= state.timeline.tracks[0].clips[0].duration
+        );
+    }
+
+    #[test]
+    fn recovery_resets_invalid_selected_chase_step() {
+        let mut state = StudioState::default();
+        state.chase_system.selected = Some(crate::core::ChaseId(1));
+        state.chase_system.selected_step = Some(99);
+
+        let report = validate_state(&state);
+        let recovered = recover_state(&mut state, &report);
+
+        assert!(recovered.valid);
+        assert_eq!(state.chase_system.selected_step, Some(0));
+    }
+
+    #[test]
+    fn recovery_clamps_zero_chase_step_duration() {
+        let mut state = StudioState::default();
+        state.chase_system.chases[0].steps[0].duration = BeatTime::ZERO;
+
+        let report = validate_state(&state);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "chase.step.duration.zero")
+        );
+
+        let recovered = recover_state(&mut state, &report);
+
+        assert!(recovered.valid);
+        assert_eq!(
+            state.chase_system.chases[0].steps[0].duration,
+            MIN_CLIP_DURATION
+        );
+    }
+
+    #[test]
+    fn recovery_resets_missing_selected_venture() {
+        let mut state = StudioState::default();
+        state.venture.selected = Some("ghost-venture".to_owned());
+
+        let report = validate_state(&state);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "venture.selected.missing")
+        );
+
+        let recovered = recover_state(&mut state, &report);
+
+        assert!(recovered.valid);
+        assert!(state.venture.selected.is_none());
+    }
+
+    #[test]
+    fn recovery_resets_missing_selected_recovery_slot() {
+        let mut state = StudioState::default();
+        state.venture.selected_recovery = Some("ghost-recovery".to_owned());
+
+        let report = validate_state(&state);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "venture.recovery.selected.missing")
+        );
+
+        let recovered = recover_state(&mut state, &report);
+
+        assert!(recovered.valid);
+        assert!(state.venture.selected_recovery.is_none());
+    }
+}
