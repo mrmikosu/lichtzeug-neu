@@ -9,7 +9,12 @@ use crate::core::editor::{
 use crate::core::engine::{
     advance_engine_frame, enter_sync_phase, resume_after_sync, toggle_transport,
 };
+use crate::core::engine_link::{merge_engine_device, select_followed_deck};
 use crate::core::event::{AppEvent, StateDiff, TimelineEvent, TimelineHit, TimelineZone};
+use crate::core::hardware::{
+    controller_profile_bindings, controller_profile_from_name, is_trigger_message_active,
+    midi_control_hint, midi_value_permille, normalize_midi_binding_message,
+};
 use crate::core::history::{
     apply_redo, apply_undo, begin_history_transaction, capture_history_snapshot,
     clear_pending_history, commit_history_transaction, record_history_entry,
@@ -33,11 +38,15 @@ use crate::core::show::{
     set_selected_cue_fade_duration, set_selected_cue_name, toggle_chase, toggle_fx, trigger_cue,
 };
 use crate::core::state::{
-    ClipInlineParameterKind, ClipboardClip, ContextMenuAction, ContextMenuTarget, CpuLoad,
-    EngineErrorState, EnginePhase, HoverTarget, MIN_CLIP_DURATION, SelectionState, SnapGuide,
-    SnapPhase, StateLifecycle, StudioState, TIMELINE_CLIP_HEIGHT_PX, TIMELINE_CLIP_TOP_INSET_PX,
-    TIMELINE_HEADER_HEIGHT_PX, TIMELINE_TRACK_GAP_PX, TIMELINE_TRACK_HEIGHT_PX,
-    TimelineInteraction, TimelinePhase, VenturePhase,
+    ClipInlineParameterKind, ClipboardClip, ContextMenuAction, ContextMenuTarget,
+    ControllerProfileKind, CpuLoad, DmxBackendKind, DmxInterfaceKind, EngineDeckPhase,
+    EngineErrorState, EngineLinkPhase, EnginePhase, EnginePrimeDevice, EngineTelemetryFrame,
+    FixtureLibraryPhase, FixtureProfile, HardwareDiscoveryPhase, HoverTarget, MIN_CLIP_DURATION,
+    MidiAction, MidiBinding, MidiControlHint, MidiLearnPhase, OutputDeliveryPhase,
+    OutputDispatchReport, SelectionState, SnapGuide, SnapPhase, StateLifecycle, StudioState,
+    TIMELINE_CLIP_HEIGHT_PX, TIMELINE_CLIP_TOP_INSET_PX, TIMELINE_HEADER_HEIGHT_PX,
+    TIMELINE_TRACK_GAP_PX, TIMELINE_TRACK_HEIGHT_PX, TimelineInteraction, TimelinePhase,
+    VenturePhase,
 };
 use crate::core::time::{BeatTime, IntensityLevel, PPQ, SpeedRatio, ZoomFactor};
 use crate::core::validation::{recover_state, validate_state};
@@ -216,6 +225,407 @@ fn reduce_one(state: &mut StudioState, event: AppEvent) -> Vec<StateDiff> {
         AppEvent::RestoreSelectedRecoverySlot => restore_selected_recovery_slot_from_disk(state),
         AppEvent::AutosaveRecoverySlot(label) => autosave_recovery_slot_to_disk(state, &label),
         AppEvent::CreateNewVenture => create_new_venture(state),
+        AppEvent::RefreshHardwareInventory => {
+            state.settings.dmx.phase = HardwareDiscoveryPhase::Refreshing;
+            state.settings.midi.phase = HardwareDiscoveryPhase::Refreshing;
+            state.settings.dmx.last_error = None;
+            state.settings.midi.last_error = None;
+            state.status.hint = "Hardware-Scan gestartet".to_owned();
+            vec![StateDiff::Hardware, StateDiff::Settings]
+        }
+        AppEvent::ApplyHardwareInventory(snapshot) => {
+            let diffs = apply_hardware_inventory(state, snapshot);
+            state.status.hint = state
+                .settings
+                .dmx
+                .last_summary
+                .clone()
+                .unwrap_or_else(|| "Hardware aktualisiert".to_owned());
+            diffs
+        }
+        AppEvent::HardwareInventoryFailed(error) => {
+            state.settings.dmx.phase = HardwareDiscoveryPhase::Error;
+            state.settings.midi.phase = HardwareDiscoveryPhase::Error;
+            state.settings.dmx.last_error = Some(error.clone());
+            state.settings.midi.last_error = Some(error.clone());
+            state.status.hint = error;
+            vec![StateDiff::Hardware, StateDiff::Settings]
+        }
+        AppEvent::BeginRuntimeOutputDispatch(sequence) => {
+            state.output.phase = OutputDeliveryPhase::Dispatching;
+            state.output.sequence = sequence;
+            state.output.last_error = None;
+            state.status.hint = format!("Output dispatch {}", sequence);
+            vec![StateDiff::Output]
+        }
+        AppEvent::CompleteRuntimeOutputDispatch(report) => {
+            apply_output_dispatch_report(state, report)
+        }
+        AppEvent::RuntimeOutputDispatchFailed(sequence, detail) => {
+            state.output.phase = OutputDeliveryPhase::Error;
+            state.output.sequence = sequence;
+            state.output.last_error = Some(detail.clone());
+            state.output.last_summary = None;
+            state.status.hint = detail;
+            vec![StateDiff::Output]
+        }
+        AppEvent::SelectSettingsTab(tab) => {
+            if state.settings.selected_tab == tab {
+                Vec::new()
+            } else {
+                state.settings.selected_tab = tab;
+                vec![StateDiff::Settings]
+            }
+        }
+        AppEvent::SetShowFpsOverlay(value) => {
+            let changed = state.settings.show_fps_overlay != value;
+            state.settings.show_fps_overlay = value;
+            if changed {
+                vec![StateDiff::Settings]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SetShowCpuOverlay(value) => {
+            let changed = state.settings.show_cpu_overlay != value;
+            state.settings.show_cpu_overlay = value;
+            if changed {
+                vec![StateDiff::Settings]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SetSmoothPlayhead(value) => {
+            let changed = state.settings.smooth_playhead != value;
+            state.settings.smooth_playhead = value;
+            if changed {
+                vec![StateDiff::Settings]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SetFollowPlayhead(value) => {
+            let changed = state.settings.follow_playhead != value;
+            state.settings.follow_playhead = value;
+            if changed {
+                vec![StateDiff::Settings]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::RefreshEngineLinkDiscovery => {
+            state.settings.engine_link.phase = if state.settings.engine_link.enabled {
+                EngineLinkPhase::Discovering
+            } else {
+                EngineLinkPhase::Disabled
+            };
+            state.settings.engine_link.last_error = None;
+            state.settings.engine_link.last_summary = Some(
+                "StageLinq-Discovery aktiv. Auf Prime-/Engine-Announcements warten.".to_owned(),
+            );
+            state.status.hint = "Engine-Link Discovery gestartet".to_owned();
+            vec![
+                StateDiff::Settings,
+                StateDiff::EngineLink,
+                StateDiff::Hardware,
+            ]
+        }
+        AppEvent::SetEngineLinkMode(mode) => {
+            let changed = state.settings.engine_link.mode != mode;
+            state.settings.engine_link.mode = mode;
+            if matches!(mode, crate::core::EngineLinkMode::Disabled) {
+                state.settings.engine_link.enabled = false;
+                state.settings.engine_link.phase = EngineLinkPhase::Disabled;
+            } else if state.settings.engine_link.enabled {
+                state.settings.engine_link.phase = EngineLinkPhase::Idle;
+            }
+            if changed {
+                state.settings.engine_link.last_error = None;
+                state.settings.engine_link.last_summary =
+                    Some(format!("Engine-Link Modus {:?}", mode));
+                vec![StateDiff::Settings, StateDiff::EngineLink]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SetEngineLinkEnabled(value) => {
+            let changed = state.settings.engine_link.enabled != value;
+            state.settings.engine_link.enabled = value;
+            state.settings.engine_link.phase = if value {
+                EngineLinkPhase::Idle
+            } else {
+                EngineLinkPhase::Disabled
+            };
+            if !value {
+                state.settings.engine_link.telemetry = None;
+            }
+            if changed {
+                state.settings.engine_link.last_error = None;
+                state.settings.engine_link.last_summary = Some(if value {
+                    "Engine-Link aktiviert".to_owned()
+                } else {
+                    "Engine-Link deaktiviert".to_owned()
+                });
+                vec![
+                    StateDiff::Settings,
+                    StateDiff::EngineLink,
+                    StateDiff::Hardware,
+                ]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SetEngineLinkAutoConnect(value) => {
+            let changed = state.settings.engine_link.auto_connect != value;
+            state.settings.engine_link.auto_connect = value;
+            if changed {
+                vec![StateDiff::Settings, StateDiff::EngineLink]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SetEngineLinkAdoptTransport(value) => {
+            let changed = state.settings.engine_link.adopt_transport != value;
+            state.settings.engine_link.adopt_transport = value;
+            if changed {
+                let mut diffs = vec![StateDiff::Settings, StateDiff::EngineLink];
+                if value {
+                    diffs.extend(sync_engine_transport_from_link(state));
+                }
+                diffs
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SetEngineLinkFollowMode(mode) => {
+            let changed = state.settings.engine_link.follow_mode != mode;
+            state.settings.engine_link.follow_mode = mode;
+            if changed {
+                let mut diffs = vec![StateDiff::Settings, StateDiff::EngineLink];
+                diffs.extend(sync_engine_transport_from_link(state));
+                diffs
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SelectEngineLinkDevice(device_id) => {
+            let diffs = select_engine_link_device(state, device_id.as_deref());
+            if diffs.is_empty() {
+                state.status.hint = "Engine-Link Device unverändert".to_owned();
+            }
+            diffs
+        }
+        AppEvent::ApplyEngineLinkDiscoveryDevice(device) => {
+            let diffs = apply_engine_link_discovery_device(state, device);
+            if diffs.is_empty() {
+                state.status.hint = "Engine-Link Discovery unverändert".to_owned();
+            }
+            diffs
+        }
+        AppEvent::ApplyEngineLinkTelemetry(frame) => apply_engine_link_telemetry(state, frame),
+        AppEvent::EngineLinkDiscoveryFailed(detail) => {
+            state.settings.engine_link.phase = EngineLinkPhase::Error;
+            state.settings.engine_link.last_error = Some(detail.clone());
+            state.settings.engine_link.last_summary = None;
+            state.status.hint = detail;
+            vec![
+                StateDiff::Settings,
+                StateDiff::EngineLink,
+                StateDiff::Hardware,
+            ]
+        }
+        AppEvent::SetDmxBackend(backend) => {
+            let changed = state.settings.dmx.backend != backend;
+            state.settings.dmx.backend = backend;
+            state.settings.dmx.last_error = None;
+            if changed {
+                state.settings.dmx.last_summary = Some(format!("DMX-Backend {:?}", backend));
+                vec![StateDiff::Settings, StateDiff::Hardware]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SetDmxOutputEnabled(value) => {
+            let changed = state.settings.dmx.output_enabled != value;
+            state.settings.dmx.output_enabled = value;
+            if changed {
+                vec![StateDiff::Settings, StateDiff::Hardware]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SetDmxAutoConnect(value) => {
+            let changed = state.settings.dmx.auto_connect != value;
+            state.settings.dmx.auto_connect = value;
+            if changed {
+                vec![StateDiff::Settings]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SetDmxBlackoutOnStop(value) => {
+            let changed = state.settings.dmx.blackout_on_stop != value;
+            state.settings.dmx.blackout_on_stop = value;
+            if changed {
+                vec![StateDiff::Settings]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SelectDmxInterface(interface_id) => {
+            let diffs = select_dmx_interface(state, interface_id.as_deref());
+            if diffs.is_empty() {
+                state.status.hint = "DMX-Interface unverändert".to_owned();
+            }
+            diffs
+        }
+        AppEvent::SetArtNetTarget(target) => {
+            let target = target.trim().to_owned();
+            let changed = state.settings.dmx.artnet_target != target;
+            state.settings.dmx.artnet_target = target;
+            if changed {
+                vec![StateDiff::Settings]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SetArtNetUniverse(universe) => {
+            let universe = universe.clamp(1, 64);
+            let changed = state.settings.dmx.artnet_universe != universe;
+            state.settings.dmx.artnet_universe = universe;
+            if changed {
+                vec![StateDiff::Settings]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SetSacnTarget(target) => {
+            let target = target.trim().to_owned();
+            let changed = state.settings.dmx.sacn_target != target;
+            state.settings.dmx.sacn_target = target;
+            if changed {
+                vec![StateDiff::Settings]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SetSacnUniverse(universe) => {
+            let universe = universe.clamp(1, 64);
+            let changed = state.settings.dmx.sacn_universe != universe;
+            state.settings.dmx.sacn_universe = universe;
+            if changed {
+                vec![StateDiff::Settings]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SetDmxRefreshRate(rate) => {
+            let rate = rate.clamp(1, 44);
+            let changed = state.settings.dmx.refresh_rate_hz != rate;
+            state.settings.dmx.refresh_rate_hz = rate;
+            if changed {
+                vec![StateDiff::Settings]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SetEnttecBreakMicros(value) => {
+            let value = value.clamp(88, 1000);
+            let changed = state.settings.dmx.enttec_break_us != value;
+            state.settings.dmx.enttec_break_us = value;
+            if changed {
+                vec![StateDiff::Settings]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SetEnttecMabMicros(value) => {
+            let value = value.clamp(8, 1000);
+            let changed = state.settings.dmx.enttec_mark_after_break_us != value;
+            state.settings.dmx.enttec_mark_after_break_us = value;
+            if changed {
+                vec![StateDiff::Settings]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SelectMidiInput(port_id) => {
+            let diffs = select_midi_input(state, port_id.as_deref());
+            if diffs.is_empty() {
+                state.status.hint = "MIDI-Input unverändert".to_owned();
+            }
+            diffs
+        }
+        AppEvent::SelectMidiOutput(port_id) => {
+            let diffs = select_midi_output(state, port_id.as_deref());
+            if diffs.is_empty() {
+                state.status.hint = "MIDI-Output unverändert".to_owned();
+            }
+            diffs
+        }
+        AppEvent::SetMidiFeedbackEnabled(value) => {
+            let changed = state.settings.midi.feedback_enabled != value;
+            state.settings.midi.feedback_enabled = value;
+            if changed {
+                vec![StateDiff::Settings]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::ApplyDetectedControllerAutomap => {
+            let diffs = apply_detected_controller_automap(state);
+            if diffs.is_empty() {
+                state.status.hint = "Kein Automap verfügbar".to_owned();
+            }
+            diffs
+        }
+        AppEvent::ClearMidiBindings => {
+            let diffs = clear_midi_bindings(state);
+            if diffs.is_empty() {
+                state.status.hint = "Keine MIDI-Bindings".to_owned();
+            }
+            diffs
+        }
+        AppEvent::StartMidiLearn(binding_id) => {
+            let diffs = start_midi_learn(state, binding_id);
+            if diffs.is_empty() {
+                state.status.hint = "MIDI Learn nicht möglich".to_owned();
+            }
+            diffs
+        }
+        AppEvent::CancelMidiLearn => {
+            let diffs = cancel_midi_learn(state);
+            if diffs.is_empty() {
+                state.status.hint = "MIDI Learn war nicht aktiv".to_owned();
+            }
+            diffs
+        }
+        AppEvent::CompleteMidiLearn(message) => {
+            let diffs = complete_midi_learn(state, &message);
+            if diffs.is_empty() {
+                state.status.hint = "MIDI Learn ignoriert".to_owned();
+            }
+            diffs
+        }
+        AppEvent::ReceiveMidiRuntimeMessage(message) => {
+            let diffs = apply_runtime_midi_message(state, &message);
+            if diffs.is_empty() {
+                state.status.hint = format!(
+                    "MIDI {} ch{} key{}",
+                    midi_message_label(&message),
+                    message.channel,
+                    message.key
+                );
+            }
+            diffs
+        }
+        AppEvent::RemoveMidiBinding(binding_id) => {
+            let diffs = remove_midi_binding(state, binding_id);
+            if diffs.is_empty() {
+                state.status.hint = "MIDI-Binding nicht gefunden".to_owned();
+            }
+            diffs
+        }
         AppEvent::DuplicateSelectedClips => {
             let diffs = duplicate_selected_clips(state);
             state.status.hint = if diffs.is_empty() {
@@ -488,6 +898,181 @@ fn reduce_one(state: &mut StudioState, event: AppEvent) -> Vec<StateDiff> {
         AppEvent::SelectFixtureGroup(group_id) => {
             state.status.hint = format!("Fixture {} selektiert", group_id.0);
             select_fixture_group(state, group_id)
+        }
+        AppEvent::SetFixtureOflManufacturerKey(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            let changed = state.fixture_system.library.ofl_manufacturer_key != value;
+            state.fixture_system.library.ofl_manufacturer_key = value.clone();
+            state.fixture_system.library.last_error = None;
+            if changed {
+                state.status.hint = format!("OFL Hersteller {}", value);
+                vec![StateDiff::FixtureLibrary]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SetFixtureOflFixtureKey(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            let changed = state.fixture_system.library.ofl_fixture_key != value;
+            state.fixture_system.library.ofl_fixture_key = value.clone();
+            state.fixture_system.library.last_error = None;
+            if changed {
+                state.status.hint = format!("OFL Fixture {}", value);
+                vec![StateDiff::FixtureLibrary]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SetFixtureQxfImportPath(path) => {
+            let path = path.trim().to_owned();
+            let changed = state.fixture_system.library.qxf_import_path != path;
+            state.fixture_system.library.qxf_import_path = path;
+            state.fixture_system.library.last_error = None;
+            if changed {
+                state.status.hint = "QXF Import-Pfad aktualisiert".to_owned();
+                vec![StateDiff::FixtureLibrary]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::SetFixtureQxfExportPath(path) => {
+            let path = path.trim().to_owned();
+            let changed = state.fixture_system.library.qxf_export_path != path;
+            state.fixture_system.library.qxf_export_path = path;
+            state.fixture_system.library.last_error = None;
+            if changed {
+                state.status.hint = "QXF Export-Pfad aktualisiert".to_owned();
+                vec![StateDiff::FixtureLibrary]
+            } else {
+                Vec::new()
+            }
+        }
+        AppEvent::RequestImportFixtureFromOfl => {
+            state.fixture_system.library.phase = FixtureLibraryPhase::Importing;
+            state.fixture_system.library.last_error = None;
+            state.fixture_system.library.last_summary = Some("OFL-Import angefordert".to_owned());
+            state.status.hint = "Fixture wird aus OFL geladen".to_owned();
+            vec![StateDiff::FixtureLibrary]
+        }
+        AppEvent::RequestImportFixtureFromQxfPath => {
+            state.fixture_system.library.phase = FixtureLibraryPhase::Importing;
+            state.fixture_system.library.last_error = None;
+            state.fixture_system.library.last_summary = Some("QXF-Import angefordert".to_owned());
+            state.status.hint = "Fixture wird aus QXF importiert".to_owned();
+            vec![StateDiff::FixtureLibrary]
+        }
+        AppEvent::ApplyImportedFixtureProfile(profile) => {
+            let imported_id = profile.id.clone();
+            let diffs = apply_imported_fixture_profile(state, profile);
+            state.status.hint = if diffs.is_empty() {
+                "Fixture-Import ohne Änderung".to_owned()
+            } else {
+                format!("Fixture {} importiert", imported_id)
+            };
+            diffs
+        }
+        AppEvent::SelectFixtureProfile(profile_id) => {
+            let diffs = select_fixture_profile(state, &profile_id);
+            state.status.hint = if diffs.is_empty() {
+                "Fixture-Profil nicht gefunden".to_owned()
+            } else {
+                format!("Fixture-Profil {} selektiert", profile_id)
+            };
+            diffs
+        }
+        AppEvent::DeleteSelectedFixtureProfile => {
+            let diffs = delete_selected_fixture_profile(state);
+            state.status.hint = if diffs.is_empty() {
+                "Kein Fixture-Profil gelöscht".to_owned()
+            } else {
+                "Fixture-Profil gelöscht".to_owned()
+            };
+            diffs
+        }
+        AppEvent::RequestExportSelectedFixtureAsQxf => {
+            state.fixture_system.library.phase = FixtureLibraryPhase::Exporting;
+            state.fixture_system.library.last_error = None;
+            state.fixture_system.library.last_summary = Some("QXF-Export angefordert".to_owned());
+            state.status.hint = "Fixture wird als QXF exportiert".to_owned();
+            vec![StateDiff::FixtureLibrary]
+        }
+        AppEvent::CompleteFixtureQxfExport(path) => {
+            state.fixture_system.library.phase = FixtureLibraryPhase::Idle;
+            state.fixture_system.library.last_error = None;
+            state.fixture_system.library.last_summary =
+                Some(format!("QXF exportiert nach {}", path));
+            state.status.hint = format!("QXF exportiert: {}", path);
+            vec![StateDiff::FixtureLibrary]
+        }
+        AppEvent::FixtureIoFailed(error) => {
+            state.fixture_system.library.phase = FixtureLibraryPhase::Error;
+            state.fixture_system.library.last_error = Some(error.clone());
+            state.status.hint = error;
+            vec![StateDiff::FixtureLibrary]
+        }
+        AppEvent::CreateFixturePatch => {
+            let diffs = create_fixture_patch(state);
+            state.status.hint = if diffs.is_empty() {
+                "Fixture-Patch konnte nicht angelegt werden".to_owned()
+            } else {
+                "Fixture-Patch angelegt".to_owned()
+            };
+            diffs
+        }
+        AppEvent::SelectFixturePatch(patch_id) => {
+            let diffs = select_fixture_patch(state, patch_id);
+            state.status.hint = if diffs.is_empty() {
+                "Fixture-Patch nicht gefunden".to_owned()
+            } else {
+                format!("Fixture-Patch {} selektiert", patch_id)
+            };
+            diffs
+        }
+        AppEvent::DeleteSelectedFixturePatch => {
+            let diffs = delete_selected_fixture_patch(state);
+            state.status.hint = if diffs.is_empty() {
+                "Kein Fixture-Patch gelöscht".to_owned()
+            } else {
+                "Fixture-Patch gelöscht".to_owned()
+            };
+            diffs
+        }
+        AppEvent::SetSelectedFixturePatchName(name) => {
+            let diffs = set_selected_fixture_patch_name(state, name);
+            if !diffs.is_empty() {
+                state.status.hint = "Fixture-Patch umbenannt".to_owned();
+            }
+            diffs
+        }
+        AppEvent::SetSelectedFixturePatchMode(mode_name) => {
+            let diffs = set_selected_fixture_patch_mode(state, &mode_name);
+            if !diffs.is_empty() {
+                state.status.hint = format!("Fixture-Mode {}", mode_name);
+            }
+            diffs
+        }
+        AppEvent::SetSelectedFixturePatchUniverse(universe) => {
+            let diffs = set_selected_fixture_patch_universe(state, universe);
+            if !diffs.is_empty() {
+                state.status.hint = format!("Fixture-Universe {}", universe);
+            }
+            diffs
+        }
+        AppEvent::SetSelectedFixturePatchAddress(address) => {
+            let diffs = set_selected_fixture_patch_address(state, address);
+            if !diffs.is_empty() {
+                state.status.hint = format!("Fixture-Adresse {}", address);
+            }
+            diffs
+        }
+        AppEvent::SetSelectedFixturePatchGroup(group_id) => {
+            let diffs = set_selected_fixture_patch_group(state, group_id);
+            if !diffs.is_empty() {
+                state.status.hint = group_id
+                    .map(|group_id| format!("Fixture-Gruppe {}", group_id.0))
+                    .unwrap_or_else(|| "Fixture-Gruppe gelöst".to_owned());
+            }
+            diffs
         }
         AppEvent::OpenClipEditor(clip_id) => {
             state.status.hint = format!("Clip {} editor geöffnet", clip_id.0);
@@ -1064,6 +1649,1021 @@ fn sync_venture_dirty_state(state: &mut StudioState, diffs: &mut Vec<StateDiff>)
     if state.venture.dirty != dirty {
         state.venture.dirty = dirty;
         diffs.push(StateDiff::Venture);
+    }
+}
+
+fn apply_imported_fixture_profile(
+    state: &mut StudioState,
+    profile: FixtureProfile,
+) -> Vec<StateDiff> {
+    let profile_id = profile.id.clone();
+    let default_export_path = format!("fixtures/{}.qxf", profile_id);
+    if let Some(existing) = state
+        .fixture_system
+        .library
+        .profiles
+        .iter_mut()
+        .find(|existing| existing.id == profile_id)
+    {
+        *existing = profile;
+    } else {
+        state.fixture_system.library.profiles.push(profile);
+        state
+            .fixture_system
+            .library
+            .profiles
+            .sort_by(|left, right| left.id.cmp(&right.id));
+    }
+
+    state.fixture_system.library.selected_profile = Some(profile_id.clone());
+    state.fixture_system.library.selected_patch = state
+        .fixture_system
+        .library
+        .patches
+        .iter()
+        .find(|patch| patch.profile_id == profile_id)
+        .map(|patch| patch.id);
+    state.fixture_system.library.phase = FixtureLibraryPhase::Idle;
+    state.fixture_system.library.last_error = None;
+    state.fixture_system.library.last_summary =
+        Some(format!("Fixture-Profil {} importiert", profile_id));
+    if state
+        .fixture_system
+        .library
+        .qxf_export_path
+        .trim()
+        .is_empty()
+    {
+        state.fixture_system.library.qxf_export_path = default_export_path;
+    }
+
+    vec![StateDiff::FixtureLibrary]
+}
+
+fn select_fixture_profile(state: &mut StudioState, profile_id: &str) -> Vec<StateDiff> {
+    if state.fixture_profile(profile_id).is_none() {
+        return Vec::new();
+    }
+
+    state.fixture_system.library.selected_profile = Some(profile_id.to_owned());
+    state.fixture_system.library.selected_patch = state
+        .fixture_system
+        .library
+        .patches
+        .iter()
+        .find(|patch| patch.profile_id == profile_id)
+        .map(|patch| patch.id);
+
+    if state
+        .fixture_system
+        .library
+        .qxf_export_path
+        .trim()
+        .is_empty()
+    {
+        state.fixture_system.library.qxf_export_path = format!("fixtures/{}.qxf", profile_id);
+    }
+
+    vec![StateDiff::FixtureLibrary]
+}
+
+fn delete_selected_fixture_profile(state: &mut StudioState) -> Vec<StateDiff> {
+    let Some(profile_id) = state.fixture_system.library.selected_profile.clone() else {
+        return Vec::new();
+    };
+    let Some(index) = state
+        .fixture_system
+        .library
+        .profiles
+        .iter()
+        .position(|profile| profile.id == profile_id)
+    else {
+        return Vec::new();
+    };
+
+    state.fixture_system.library.profiles.remove(index);
+    state
+        .fixture_system
+        .library
+        .patches
+        .retain(|patch| patch.profile_id != profile_id);
+    state.fixture_system.library.selected_profile = state
+        .fixture_system
+        .library
+        .profiles
+        .get(index)
+        .or_else(|| {
+            index
+                .checked_sub(1)
+                .and_then(|prev| state.fixture_system.library.profiles.get(prev))
+        })
+        .map(|profile| profile.id.clone());
+    state.fixture_system.library.selected_patch = state
+        .fixture_system
+        .library
+        .selected_profile
+        .as_deref()
+        .and_then(|selected| {
+            state
+                .fixture_system
+                .library
+                .patches
+                .iter()
+                .find(|patch| patch.profile_id == selected)
+                .map(|patch| patch.id)
+        });
+    state.fixture_system.library.phase = FixtureLibraryPhase::Idle;
+    state.fixture_system.library.last_error = None;
+    state.fixture_system.library.last_summary =
+        Some(format!("Fixture-Profil {} gelöscht", profile_id));
+    if state
+        .fixture_system
+        .library
+        .qxf_export_path
+        .contains(&profile_id)
+    {
+        state.fixture_system.library.qxf_export_path.clear();
+    }
+
+    vec![StateDiff::FixtureLibrary]
+}
+
+fn create_fixture_patch(state: &mut StudioState) -> Vec<StateDiff> {
+    let Some(profile) = state.selected_fixture_profile().cloned() else {
+        return Vec::new();
+    };
+    let Some(mode_name) = profile.modes.first().map(|mode| mode.name.clone()) else {
+        return Vec::new();
+    };
+    let (universe, address) = state.next_fixture_patch_placement(&profile, &mode_name);
+
+    let patch = crate::core::FixturePatch {
+        id: state.next_fixture_patch_id(),
+        profile_id: profile.id.clone(),
+        name: format!("{} {}", profile.manufacturer, profile.model),
+        mode_name,
+        universe,
+        address,
+        group_id: state.fixture_system.selected,
+        enabled: true,
+    };
+
+    state.fixture_system.library.selected_patch = Some(patch.id);
+    state.fixture_system.library.last_summary = Some(format!(
+        "Fixture-Patch {} @ U{}.{} angelegt",
+        patch.name, patch.universe, patch.address
+    ));
+    state.fixture_system.library.patches.push(patch);
+
+    vec![StateDiff::FixtureLibrary]
+}
+
+fn select_fixture_patch(state: &mut StudioState, patch_id: u32) -> Vec<StateDiff> {
+    if state.fixture_patch(patch_id).is_none() {
+        return Vec::new();
+    }
+
+    state.fixture_system.library.selected_patch = Some(patch_id);
+    if let Some(patch) = state.fixture_patch(patch_id) {
+        state.fixture_system.library.selected_profile = Some(patch.profile_id.clone());
+    }
+
+    vec![StateDiff::FixtureLibrary]
+}
+
+fn delete_selected_fixture_patch(state: &mut StudioState) -> Vec<StateDiff> {
+    let Some(patch_id) = state.fixture_system.library.selected_patch else {
+        return Vec::new();
+    };
+    let Some(index) = state
+        .fixture_system
+        .library
+        .patches
+        .iter()
+        .position(|patch| patch.id == patch_id)
+    else {
+        return Vec::new();
+    };
+
+    state.fixture_system.library.patches.remove(index);
+    state.fixture_system.library.selected_patch = state
+        .fixture_system
+        .library
+        .patches
+        .get(index)
+        .or_else(|| {
+            index
+                .checked_sub(1)
+                .and_then(|prev| state.fixture_system.library.patches.get(prev))
+        })
+        .map(|patch| patch.id);
+    state.fixture_system.library.last_summary =
+        Some(format!("Fixture-Patch {} gelöscht", patch_id));
+
+    vec![StateDiff::FixtureLibrary]
+}
+
+fn set_selected_fixture_patch_name(state: &mut StudioState, name: String) -> Vec<StateDiff> {
+    let Some(patch_id) = state.fixture_system.library.selected_patch else {
+        return Vec::new();
+    };
+    let Some(patch) = state
+        .fixture_system
+        .library
+        .patches
+        .iter_mut()
+        .find(|patch| patch.id == patch_id)
+    else {
+        return Vec::new();
+    };
+    let name = name.trim().to_owned();
+    if name.is_empty() || patch.name == name {
+        return Vec::new();
+    }
+    patch.name = name;
+    vec![StateDiff::FixtureLibrary]
+}
+
+fn set_selected_fixture_patch_mode(state: &mut StudioState, mode_name: &str) -> Vec<StateDiff> {
+    let Some(patch_id) = state.fixture_system.library.selected_patch else {
+        return Vec::new();
+    };
+    let Some(position) = state
+        .fixture_system
+        .library
+        .patches
+        .iter()
+        .position(|patch| patch.id == patch_id)
+    else {
+        return Vec::new();
+    };
+    let profile_id = state.fixture_system.library.patches[position]
+        .profile_id
+        .clone();
+    let Some(profile) = state.fixture_profile(&profile_id) else {
+        return Vec::new();
+    };
+    if !profile.modes.iter().any(|mode| mode.name == mode_name) {
+        return Vec::new();
+    }
+    if state.fixture_system.library.patches[position].mode_name == mode_name {
+        return Vec::new();
+    }
+    state.fixture_system.library.patches[position].mode_name = mode_name.to_owned();
+    vec![StateDiff::FixtureLibrary]
+}
+
+fn set_selected_fixture_patch_universe(state: &mut StudioState, universe: u16) -> Vec<StateDiff> {
+    let Some(patch_id) = state.fixture_system.library.selected_patch else {
+        return Vec::new();
+    };
+    let Some(patch) = state
+        .fixture_system
+        .library
+        .patches
+        .iter_mut()
+        .find(|patch| patch.id == patch_id)
+    else {
+        return Vec::new();
+    };
+    let universe = universe.clamp(1, 64);
+    if patch.universe == universe {
+        return Vec::new();
+    }
+    patch.universe = universe;
+    vec![StateDiff::FixtureLibrary]
+}
+
+fn set_selected_fixture_patch_address(state: &mut StudioState, address: u16) -> Vec<StateDiff> {
+    let Some(patch_id) = state.fixture_system.library.selected_patch else {
+        return Vec::new();
+    };
+    let Some(patch) = state
+        .fixture_system
+        .library
+        .patches
+        .iter_mut()
+        .find(|patch| patch.id == patch_id)
+    else {
+        return Vec::new();
+    };
+    let address = address.clamp(1, 512);
+    if patch.address == address {
+        return Vec::new();
+    }
+    patch.address = address;
+    vec![StateDiff::FixtureLibrary]
+}
+
+fn set_selected_fixture_patch_group(
+    state: &mut StudioState,
+    group_id: Option<crate::core::FixtureGroupId>,
+) -> Vec<StateDiff> {
+    if let Some(group_id) = group_id
+        && state.fixture_group(group_id).is_none()
+    {
+        return Vec::new();
+    }
+
+    let Some(patch_id) = state.fixture_system.library.selected_patch else {
+        return Vec::new();
+    };
+    let Some(patch) = state
+        .fixture_system
+        .library
+        .patches
+        .iter_mut()
+        .find(|patch| patch.id == patch_id)
+    else {
+        return Vec::new();
+    };
+
+    if patch.group_id == group_id {
+        return Vec::new();
+    }
+
+    patch.group_id = group_id;
+    vec![StateDiff::FixtureLibrary]
+}
+
+fn apply_hardware_inventory(
+    state: &mut StudioState,
+    snapshot: crate::core::HardwareInventorySnapshot,
+) -> Vec<StateDiff> {
+    state.settings.dmx.interfaces = snapshot.dmx_interfaces;
+    state.settings.midi.inputs = snapshot.midi_inputs;
+    state.settings.midi.outputs = snapshot.midi_outputs;
+    state.settings.dmx.phase = HardwareDiscoveryPhase::Idle;
+    state.settings.midi.phase = HardwareDiscoveryPhase::Idle;
+
+    if state
+        .settings
+        .dmx
+        .selected_interface
+        .as_deref()
+        .is_some_and(|selected| {
+            !state
+                .settings
+                .dmx
+                .interfaces
+                .iter()
+                .any(|interface| interface.id == selected)
+        })
+    {
+        state.settings.dmx.selected_interface = None;
+    }
+
+    if state.settings.dmx.auto_connect
+        && state.settings.dmx.selected_interface.is_none()
+        && state.settings.dmx.backend == DmxBackendKind::EnttecOpenDmx
+    {
+        state.settings.dmx.selected_interface = state
+            .settings
+            .dmx
+            .interfaces
+            .iter()
+            .find(|interface| interface.kind == DmxInterfaceKind::EnttecOpenDmxCompatible)
+            .or_else(|| state.settings.dmx.interfaces.first())
+            .map(|interface| interface.id.clone());
+    }
+
+    if state
+        .settings
+        .midi
+        .selected_input
+        .as_deref()
+        .is_some_and(|selected| {
+            !state
+                .settings
+                .midi
+                .inputs
+                .iter()
+                .any(|port| port.id == selected)
+        })
+    {
+        state.settings.midi.selected_input = None;
+    }
+
+    if state
+        .settings
+        .midi
+        .selected_output
+        .as_deref()
+        .is_some_and(|selected| {
+            !state
+                .settings
+                .midi
+                .outputs
+                .iter()
+                .any(|port| port.id == selected)
+        })
+    {
+        state.settings.midi.selected_output = None;
+    }
+
+    if state.settings.midi.selected_input.is_none() {
+        state.settings.midi.selected_input = state
+            .settings
+            .midi
+            .inputs
+            .iter()
+            .find(|port| port.profile_hint.is_some())
+            .or_else(|| state.settings.midi.inputs.first())
+            .map(|port| port.id.clone());
+    }
+
+    state.settings.midi.detected_controller = state.selected_midi_input().and_then(|port| {
+        port.profile_hint
+            .or_else(|| controller_profile_from_name(&port.name))
+    });
+    state.settings.dmx.last_error = None;
+    state.settings.midi.last_error = None;
+    state.settings.dmx.last_summary = Some(format!(
+        "{} DMX / {} MIDI In / {} MIDI Out",
+        state.settings.dmx.interfaces.len(),
+        state.settings.midi.inputs.len(),
+        state.settings.midi.outputs.len()
+    ));
+    state.settings.midi.last_summary = state
+        .settings
+        .midi
+        .detected_controller
+        .map(|profile| format!("Controller erkannt: {}", controller_profile_label(profile)));
+
+    vec![StateDiff::Hardware, StateDiff::Settings]
+}
+
+fn select_engine_link_device(state: &mut StudioState, device_id: Option<&str>) -> Vec<StateDiff> {
+    let next = device_id
+        .filter(|id| {
+            state
+                .settings
+                .engine_link
+                .devices
+                .iter()
+                .any(|device| device.id == *id)
+        })
+        .map(str::to_owned);
+
+    if state.settings.engine_link.selected_device == next {
+        return Vec::new();
+    }
+
+    state.settings.engine_link.selected_device = next;
+    state.settings.engine_link.telemetry = None;
+    state.settings.engine_link.phase = if state.settings.engine_link.selected_device.is_some() {
+        EngineLinkPhase::DeviceSelected
+    } else if state.settings.engine_link.enabled {
+        EngineLinkPhase::Idle
+    } else {
+        EngineLinkPhase::Disabled
+    };
+    state.settings.engine_link.last_summary = state
+        .selected_engine_device()
+        .map(|device| format!("Engine Device {}", device.name))
+        .or_else(|| Some("Engine Device geloest".to_owned()));
+    vec![
+        StateDiff::Settings,
+        StateDiff::EngineLink,
+        StateDiff::Hardware,
+    ]
+}
+
+fn apply_engine_link_discovery_device(
+    state: &mut StudioState,
+    mut device: EnginePrimeDevice,
+) -> Vec<StateDiff> {
+    device.last_seen_frame = state.engine.clock.frame_index;
+    let changed = merge_engine_device(&mut state.settings.engine_link.devices, device.clone());
+
+    if state
+        .settings
+        .engine_link
+        .selected_device
+        .as_deref()
+        .is_some_and(|selected| selected == device.id)
+    {
+        state.settings.engine_link.phase = if state.settings.engine_link.telemetry.is_some() {
+            EngineLinkPhase::Monitoring
+        } else {
+            EngineLinkPhase::DeviceSelected
+        };
+    } else if state.settings.engine_link.auto_connect
+        && state.settings.engine_link.selected_device.is_none()
+    {
+        state.settings.engine_link.selected_device = Some(device.id.clone());
+        state.settings.engine_link.phase = EngineLinkPhase::DeviceSelected;
+    } else if state.settings.engine_link.enabled {
+        state.settings.engine_link.phase = EngineLinkPhase::Discovering;
+    }
+
+    state.settings.engine_link.last_error = None;
+    state.settings.engine_link.last_summary = Some(format!(
+        "Engine-Link: {} auf {}",
+        device.name, device.address
+    ));
+    if changed {
+        vec![
+            StateDiff::Settings,
+            StateDiff::EngineLink,
+            StateDiff::Hardware,
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+fn apply_engine_link_telemetry(
+    state: &mut StudioState,
+    frame: EngineTelemetryFrame,
+) -> Vec<StateDiff> {
+    let selected = state.settings.engine_link.selected_device.clone();
+    if let Some(selected_device) = selected.as_deref()
+        && selected_device != frame.device_id
+    {
+        return Vec::new();
+    }
+
+    if state.settings.engine_link.selected_device.is_none()
+        && state.settings.engine_link.auto_connect
+    {
+        state.settings.engine_link.selected_device = Some(frame.device_id.clone());
+    }
+
+    state.settings.engine_link.telemetry = Some(frame.clone());
+    state.settings.engine_link.phase = EngineLinkPhase::Monitoring;
+    state.settings.engine_link.last_error = None;
+    state.settings.engine_link.last_summary = Some(frame.summary.clone());
+
+    let mut diffs = vec![
+        StateDiff::Settings,
+        StateDiff::EngineLink,
+        StateDiff::Hardware,
+    ];
+    diffs.extend(sync_engine_transport_from_link(state));
+    state.status.hint = frame.summary;
+    diffs
+}
+
+fn sync_engine_transport_from_link(state: &mut StudioState) -> Vec<StateDiff> {
+    if !state.settings.engine_link.adopt_transport {
+        return Vec::new();
+    }
+
+    let Some(frame) = state.settings.engine_link.telemetry.as_ref() else {
+        return Vec::new();
+    };
+    let Some(deck) = select_followed_deck(frame, state.settings.engine_link.follow_mode) else {
+        return Vec::new();
+    };
+
+    let mut diffs = Vec::new();
+    if state.engine.transport.bpm != deck.bpm {
+        state.engine.transport.bpm = deck.bpm;
+        diffs.push(StateDiff::Engine);
+    }
+    let clamped_beat = deck.beat.min(state.engine.transport.song_length);
+    if state.engine.transport.playhead != clamped_beat {
+        state.engine.transport.playhead = clamped_beat;
+        diffs.push(StateDiff::Playhead);
+    }
+
+    let target_phase = match deck.phase {
+        EngineDeckPhase::Playing | EngineDeckPhase::Syncing => EnginePhase::Running,
+        EngineDeckPhase::Paused | EngineDeckPhase::Cueing => EnginePhase::Paused,
+        EngineDeckPhase::Idle => EnginePhase::Stopped,
+    };
+    if state.engine.phase != target_phase {
+        state.engine.phase = target_phase;
+        diffs.push(StateDiff::Engine);
+    }
+
+    if !diffs.is_empty() {
+        state.status.hint = format!(
+            "Engine-Link folgt Deck {} @ {:.2} BPM",
+            deck.deck_index,
+            deck.bpm.as_f32()
+        );
+    }
+
+    diffs
+}
+
+fn apply_output_dispatch_report(
+    state: &mut StudioState,
+    report: OutputDispatchReport,
+) -> Vec<StateDiff> {
+    state.output.phase = OutputDeliveryPhase::Delivered;
+    state.output.sequence = report.sequence;
+    state.output.last_backend = report.dmx_backend;
+    state.output.last_dmx_frame_count = report.dmx_frame_count;
+    state.output.last_midi_message_count = report.midi_message_count;
+    state.output.last_summary = Some(report.summary.clone());
+    state.output.last_error = None;
+    state.status.hint = report.summary;
+    vec![StateDiff::Output]
+}
+
+fn select_dmx_interface(state: &mut StudioState, interface_id: Option<&str>) -> Vec<StateDiff> {
+    let next = interface_id
+        .filter(|id| {
+            state
+                .settings
+                .dmx
+                .interfaces
+                .iter()
+                .any(|interface| interface.id == *id)
+        })
+        .map(str::to_owned);
+
+    if state.settings.dmx.selected_interface == next {
+        return Vec::new();
+    }
+
+    state.settings.dmx.selected_interface = next;
+    state.settings.dmx.last_summary = state
+        .selected_dmx_interface()
+        .map(|interface| format!("DMX Interface {}", interface.name))
+        .or_else(|| Some("DMX Interface geloest".to_owned()));
+    vec![StateDiff::Settings, StateDiff::Hardware]
+}
+
+fn select_midi_input(state: &mut StudioState, port_id: Option<&str>) -> Vec<StateDiff> {
+    let next = port_id
+        .filter(|id| state.settings.midi.inputs.iter().any(|port| port.id == *id))
+        .map(str::to_owned);
+
+    if state.settings.midi.selected_input == next {
+        return Vec::new();
+    }
+
+    cancel_midi_learn(state);
+    state.settings.midi.selected_input = next;
+    state.settings.midi.detected_controller = state.selected_midi_input().and_then(|port| {
+        port.profile_hint
+            .or_else(|| controller_profile_from_name(&port.name))
+    });
+    state.settings.midi.last_summary = state
+        .selected_midi_input()
+        .map(|port| format!("MIDI In {}", port.name))
+        .or_else(|| Some("MIDI Input geloest".to_owned()));
+    vec![StateDiff::Settings, StateDiff::Hardware]
+}
+
+fn select_midi_output(state: &mut StudioState, port_id: Option<&str>) -> Vec<StateDiff> {
+    let next = port_id
+        .filter(|id| {
+            state
+                .settings
+                .midi
+                .outputs
+                .iter()
+                .any(|port| port.id == *id)
+        })
+        .map(str::to_owned);
+
+    if state.settings.midi.selected_output == next {
+        return Vec::new();
+    }
+
+    state.settings.midi.selected_output = next;
+    state.settings.midi.last_summary = state
+        .selected_midi_output()
+        .map(|port| format!("MIDI Out {}", port.name))
+        .or_else(|| Some("MIDI Output geloest".to_owned()));
+    vec![StateDiff::Settings, StateDiff::Hardware]
+}
+
+fn apply_detected_controller_automap(state: &mut StudioState) -> Vec<StateDiff> {
+    let Some(profile) = state.selected_controller_profile() else {
+        return Vec::new();
+    };
+    let bindings = controller_profile_bindings(profile, state.next_midi_binding_id());
+    if bindings.is_empty() {
+        return Vec::new();
+    }
+
+    state.settings.midi.bindings = bindings;
+    state.settings.midi.learn.phase = MidiLearnPhase::GuidedAutomap;
+    state.settings.midi.learn.capture_queue = state
+        .settings
+        .midi
+        .bindings
+        .iter()
+        .map(|binding| binding.id)
+        .collect();
+    state.settings.midi.learn.target_binding =
+        state.settings.midi.learn.capture_queue.first().copied();
+    state.settings.midi.learn.expected_hint = state
+        .settings
+        .midi
+        .learn
+        .target_binding
+        .and_then(|binding_id| state.midi_binding(binding_id))
+        .map(|binding| binding.hint)
+        .unwrap_or(MidiControlHint::Any);
+    state.settings.midi.last_summary = Some(format!(
+        "{} Automap bereit. Controls in Reihenfolge berühren.",
+        controller_profile_label(profile)
+    ));
+    state.settings.midi.last_error = None;
+    vec![StateDiff::Settings, StateDiff::Hardware]
+}
+
+fn clear_midi_bindings(state: &mut StudioState) -> Vec<StateDiff> {
+    if state.settings.midi.bindings.is_empty() {
+        return Vec::new();
+    }
+
+    state.settings.midi.bindings.clear();
+    cancel_midi_learn(state);
+    state.settings.midi.last_summary = Some("MIDI-Bindings gelöscht".to_owned());
+    vec![StateDiff::Settings, StateDiff::Hardware]
+}
+
+fn start_midi_learn(state: &mut StudioState, binding_id: u32) -> Vec<StateDiff> {
+    let Some((hint, label)) = state
+        .midi_binding(binding_id)
+        .map(|binding| (binding.hint, binding.label.clone()))
+    else {
+        return Vec::new();
+    };
+    if state.selected_midi_input().is_none() {
+        return Vec::new();
+    }
+
+    state.settings.midi.learn.phase = MidiLearnPhase::Listening;
+    state.settings.midi.learn.target_binding = Some(binding_id);
+    state.settings.midi.learn.capture_queue.clear();
+    state.settings.midi.learn.expected_hint = hint;
+    state.settings.midi.learn.last_captured = None;
+    state.settings.midi.last_summary = Some(format!("MIDI Learn: {}", label));
+    vec![StateDiff::Settings, StateDiff::Hardware]
+}
+
+fn cancel_midi_learn(state: &mut StudioState) -> Vec<StateDiff> {
+    let was_active = state.settings.midi.learn.phase != MidiLearnPhase::Idle
+        || state.settings.midi.learn.target_binding.is_some()
+        || !state.settings.midi.learn.capture_queue.is_empty();
+    state.settings.midi.learn.phase = MidiLearnPhase::Idle;
+    state.settings.midi.learn.target_binding = None;
+    state.settings.midi.learn.capture_queue.clear();
+    state.settings.midi.learn.expected_hint = MidiControlHint::Any;
+    if was_active {
+        vec![StateDiff::Settings, StateDiff::Hardware]
+    } else {
+        Vec::new()
+    }
+}
+
+fn complete_midi_learn(
+    state: &mut StudioState,
+    message: &crate::core::MidiRuntimeMessage,
+) -> Vec<StateDiff> {
+    let Some(binding_message) = normalize_midi_binding_message(message) else {
+        return Vec::new();
+    };
+    let message_hint = midi_control_hint(message);
+
+    state.settings.midi.last_message = Some(message.clone());
+    state.settings.midi.learn.last_captured = Some(binding_message.clone());
+
+    match state.settings.midi.learn.phase {
+        MidiLearnPhase::Listening => {
+            let Some(binding_id) = state.settings.midi.learn.target_binding else {
+                return Vec::new();
+            };
+            if !binding_accepts_message(state.midi_binding(binding_id), message_hint) {
+                return vec![StateDiff::Hardware];
+            }
+            assign_midi_binding(state, binding_id, binding_message.clone());
+            cancel_midi_learn(state);
+            state.settings.midi.last_summary = Some(format!(
+                "MIDI Learn abgeschlossen: {}",
+                binding_summary(state, binding_id)
+            ));
+            vec![StateDiff::Settings, StateDiff::Hardware]
+        }
+        MidiLearnPhase::GuidedAutomap => {
+            let Some(binding_id) = state.settings.midi.learn.capture_queue.first().copied() else {
+                return cancel_midi_learn(state);
+            };
+            if !binding_accepts_message(state.midi_binding(binding_id), message_hint) {
+                return vec![StateDiff::Hardware];
+            }
+            assign_midi_binding(state, binding_id, binding_message);
+            state.settings.midi.learn.capture_queue.remove(0);
+            state.settings.midi.learn.target_binding =
+                state.settings.midi.learn.capture_queue.first().copied();
+            state.settings.midi.learn.expected_hint = state
+                .settings
+                .midi
+                .learn
+                .target_binding
+                .and_then(|next_id| state.midi_binding(next_id))
+                .map(|binding| binding.hint)
+                .unwrap_or(MidiControlHint::Any);
+            if state.settings.midi.learn.capture_queue.is_empty() {
+                cancel_midi_learn(state);
+                state.settings.midi.last_summary =
+                    Some("Controller-Automap vollständig".to_owned());
+            } else {
+                state.settings.midi.last_summary = Some(format!(
+                    "Automap: {} control(s) verbleiben",
+                    state.settings.midi.learn.capture_queue.len()
+                ));
+            }
+            vec![StateDiff::Settings, StateDiff::Hardware]
+        }
+        MidiLearnPhase::Idle => Vec::new(),
+    }
+}
+
+fn apply_runtime_midi_message(
+    state: &mut StudioState,
+    message: &crate::core::MidiRuntimeMessage,
+) -> Vec<StateDiff> {
+    state.settings.midi.last_message = Some(message.clone());
+    let Some(binding_message) = normalize_midi_binding_message(message) else {
+        return vec![StateDiff::Hardware];
+    };
+
+    let bindings = state
+        .settings
+        .midi
+        .bindings
+        .iter()
+        .filter(|binding| binding.message.as_ref() == Some(&binding_message))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut diffs = vec![StateDiff::Hardware];
+    for binding in bindings {
+        diffs.extend(apply_midi_action(state, binding.action, message));
+    }
+    diffs
+}
+
+fn remove_midi_binding(state: &mut StudioState, binding_id: u32) -> Vec<StateDiff> {
+    let Some(index) = state
+        .settings
+        .midi
+        .bindings
+        .iter()
+        .position(|binding| binding.id == binding_id)
+    else {
+        return Vec::new();
+    };
+    state.settings.midi.bindings.remove(index);
+    if state.settings.midi.learn.target_binding == Some(binding_id) {
+        cancel_midi_learn(state);
+    }
+    state
+        .settings
+        .midi
+        .learn
+        .capture_queue
+        .retain(|id| *id != binding_id);
+    state.settings.midi.last_summary = Some(format!("Binding {} entfernt", binding_id));
+    vec![StateDiff::Settings, StateDiff::Hardware]
+}
+
+fn assign_midi_binding(
+    state: &mut StudioState,
+    binding_id: u32,
+    binding_message: crate::core::MidiBindingMessage,
+) {
+    for binding in &mut state.settings.midi.bindings {
+        if binding.id != binding_id && binding.message.as_ref() == Some(&binding_message) {
+            binding.message = None;
+            binding.learned = false;
+        }
+    }
+    if let Some(binding) = state
+        .settings
+        .midi
+        .bindings
+        .iter_mut()
+        .find(|binding| binding.id == binding_id)
+    {
+        binding.message = Some(binding_message);
+        binding.learned = true;
+    }
+}
+
+fn binding_accepts_message(binding: Option<&MidiBinding>, message_hint: MidiControlHint) -> bool {
+    match binding
+        .map(|binding| binding.hint)
+        .unwrap_or(MidiControlHint::Any)
+    {
+        MidiControlHint::Any => true,
+        MidiControlHint::Button => message_hint == MidiControlHint::Button,
+        MidiControlHint::Continuous => message_hint == MidiControlHint::Continuous,
+    }
+}
+
+fn binding_summary(state: &StudioState, binding_id: u32) -> String {
+    state
+        .midi_binding(binding_id)
+        .map(|binding| binding.label.clone())
+        .unwrap_or_else(|| format!("Binding {}", binding_id))
+}
+
+fn apply_midi_action(
+    state: &mut StudioState,
+    action: MidiAction,
+    message: &crate::core::MidiRuntimeMessage,
+) -> Vec<StateDiff> {
+    match action {
+        MidiAction::TransportToggle => {
+            if is_trigger_message_active(message) {
+                vec![toggle_transport(&mut state.engine)]
+            } else {
+                Vec::new()
+            }
+        }
+        MidiAction::MasterIntensity => {
+            let next = IntensityLevel::from_permille(midi_value_permille(message));
+            if state.master.intensity == next {
+                Vec::new()
+            } else {
+                state.master.intensity = next;
+                vec![StateDiff::Master]
+            }
+        }
+        MidiAction::MasterSpeed => {
+            let next = SpeedRatio::from_permille(midi_value_permille(message).clamp(50, 2000));
+            if state.master.speed == next {
+                Vec::new()
+            } else {
+                state.master.speed = next;
+                vec![StateDiff::Master]
+            }
+        }
+        MidiAction::TimelineZoom => {
+            let zoom_permille = 500u16.saturating_add((midi_value_permille(message) * 15) / 10);
+            let next = ZoomFactor::from_permille(zoom_permille);
+            if state.timeline.viewport.zoom == next {
+                Vec::new()
+            } else {
+                state.timeline.viewport.zoom = next;
+                vec![StateDiff::TimelineViewport]
+            }
+        }
+        MidiAction::TriggerCueSlot(slot) => {
+            if !is_trigger_message_active(message) {
+                return Vec::new();
+            }
+            let index = slot.saturating_sub(1) as usize;
+            let cue_id = state.cue_system.cues.get(index).map(|cue| cue.id);
+            cue_id
+                .map(|cue_id| trigger_cue(state, cue_id))
+                .unwrap_or_default()
+        }
+        MidiAction::TriggerChaseSlot(slot) => {
+            if !is_trigger_message_active(message) {
+                return Vec::new();
+            }
+            let index = slot.saturating_sub(1) as usize;
+            let chase_id = state.chase_system.chases.get(index).map(|chase| chase.id);
+            chase_id
+                .map(|chase_id| toggle_chase(state, chase_id))
+                .unwrap_or_default()
+        }
+        MidiAction::FocusFixtureGroupSlot(slot) => {
+            if !is_trigger_message_active(message) {
+                return Vec::new();
+            }
+            let index = slot.saturating_sub(1) as usize;
+            let group_id = state.fixture_system.groups.get(index).map(|group| group.id);
+            group_id
+                .map(|group_id| select_fixture_group(state, group_id))
+                .unwrap_or_default()
+        }
+        MidiAction::FxDepthSlot(slot) => {
+            let index = slot.saturating_sub(1) as usize;
+            let Some(layer_id) = state.fx_system.layers.get(index).map(|layer| layer.id) else {
+                return Vec::new();
+            };
+            set_fx_depth(state, layer_id, midi_value_permille(message))
+        }
+    }
+}
+
+fn midi_message_label(message: &crate::core::MidiRuntimeMessage) -> &'static str {
+    match message.kind {
+        crate::core::MidiMessageKind::Note => "note",
+        crate::core::MidiMessageKind::ControlChange => "cc",
+        crate::core::MidiMessageKind::PitchBend => "pitch",
+    }
+}
+
+fn controller_profile_label(profile: ControllerProfileKind) -> &'static str {
+    match profile {
+        ControllerProfileKind::Apc40Mk2 => "APC40 mkII",
+        ControllerProfileKind::DenonPrime2 => "Denon Prime 2",
+        ControllerProfileKind::BehringerCmdDc1 => "CMD DC-1",
+        ControllerProfileKind::BehringerCmdLc1 => "CMD LC-1",
     }
 }
 
@@ -2597,6 +4197,28 @@ fn should_record_replay_event(event: &AppEvent) -> bool {
             | AppEvent::RestoreSelectedRecoverySlot
             | AppEvent::AutosaveRecoverySlot(_)
             | AppEvent::CreateNewVenture
+            | AppEvent::SetFixtureOflManufacturerKey(_)
+            | AppEvent::SetFixtureOflFixtureKey(_)
+            | AppEvent::SetFixtureQxfImportPath(_)
+            | AppEvent::SetFixtureQxfExportPath(_)
+            | AppEvent::RequestImportFixtureFromOfl
+            | AppEvent::RequestImportFixtureFromQxfPath
+            | AppEvent::RequestExportSelectedFixtureAsQxf
+            | AppEvent::CompleteFixtureQxfExport(_)
+            | AppEvent::FixtureIoFailed(_)
+            | AppEvent::RefreshHardwareInventory
+            | AppEvent::ApplyHardwareInventory(_)
+            | AppEvent::HardwareInventoryFailed(_)
+            | AppEvent::RefreshEngineLinkDiscovery
+            | AppEvent::ApplyEngineLinkDiscoveryDevice(_)
+            | AppEvent::ApplyEngineLinkTelemetry(_)
+            | AppEvent::EngineLinkDiscoveryFailed(_)
+            | AppEvent::BeginRuntimeOutputDispatch(_)
+            | AppEvent::CompleteRuntimeOutputDispatch(_)
+            | AppEvent::RuntimeOutputDispatchFailed(_, _)
+            | AppEvent::StartMidiLearn(_)
+            | AppEvent::CancelMidiLearn
+            | AppEvent::ReceiveMidiRuntimeMessage(_)
     )
 }
 
@@ -2707,6 +4329,33 @@ fn prepare_history_action(state: &StudioState, event: &AppEvent) -> HistoryPostA
         AppEvent::SetFxWaveform(_, _) => HistoryPostAction::RecordImmediate {
             label: "FX Waveform".to_owned(),
         },
+        AppEvent::ApplyImportedFixtureProfile(_) => HistoryPostAction::RecordImmediate {
+            label: "Import Fixture Profile".to_owned(),
+        },
+        AppEvent::DeleteSelectedFixtureProfile => HistoryPostAction::RecordImmediate {
+            label: "Delete Fixture Profile".to_owned(),
+        },
+        AppEvent::CreateFixturePatch => HistoryPostAction::RecordImmediate {
+            label: "Create Fixture Patch".to_owned(),
+        },
+        AppEvent::DeleteSelectedFixturePatch => HistoryPostAction::RecordImmediate {
+            label: "Delete Fixture Patch".to_owned(),
+        },
+        AppEvent::SetSelectedFixturePatchName(_) => HistoryPostAction::RecordImmediate {
+            label: "Fixture Patch Name".to_owned(),
+        },
+        AppEvent::SetSelectedFixturePatchMode(_) => HistoryPostAction::RecordImmediate {
+            label: "Fixture Patch Mode".to_owned(),
+        },
+        AppEvent::SetSelectedFixturePatchUniverse(_) => HistoryPostAction::RecordImmediate {
+            label: "Fixture Patch Universe".to_owned(),
+        },
+        AppEvent::SetSelectedFixturePatchAddress(_) => HistoryPostAction::RecordImmediate {
+            label: "Fixture Patch Address".to_owned(),
+        },
+        AppEvent::SetSelectedFixturePatchGroup(_) => HistoryPostAction::RecordImmediate {
+            label: "Fixture Patch Group".to_owned(),
+        },
         AppEvent::SetClipEditorIntensity(_) => HistoryPostAction::RecordImmediate {
             label: "Clip Intensity".to_owned(),
         },
@@ -2745,6 +4394,93 @@ fn prepare_history_action(state: &StudioState, event: &AppEvent) -> HistoryPostA
         },
         AppEvent::DeleteClipEditorAutomationPoint => HistoryPostAction::RecordImmediate {
             label: "Automation Point Delete".to_owned(),
+        },
+        AppEvent::SetShowFpsOverlay(_) => HistoryPostAction::RecordImmediate {
+            label: "Show FPS Overlay".to_owned(),
+        },
+        AppEvent::SetShowCpuOverlay(_) => HistoryPostAction::RecordImmediate {
+            label: "Show CPU Overlay".to_owned(),
+        },
+        AppEvent::SetSmoothPlayhead(_) => HistoryPostAction::RecordImmediate {
+            label: "Smooth Playhead".to_owned(),
+        },
+        AppEvent::SetFollowPlayhead(_) => HistoryPostAction::RecordImmediate {
+            label: "Follow Playhead".to_owned(),
+        },
+        AppEvent::SetEngineLinkMode(_) => HistoryPostAction::RecordImmediate {
+            label: "Engine Link Mode".to_owned(),
+        },
+        AppEvent::SetEngineLinkEnabled(_) => HistoryPostAction::RecordImmediate {
+            label: "Engine Link Enabled".to_owned(),
+        },
+        AppEvent::SetEngineLinkAutoConnect(_) => HistoryPostAction::RecordImmediate {
+            label: "Engine Link Auto Connect".to_owned(),
+        },
+        AppEvent::SetEngineLinkAdoptTransport(_) => HistoryPostAction::RecordImmediate {
+            label: "Engine Link Adopt Transport".to_owned(),
+        },
+        AppEvent::SetEngineLinkFollowMode(_) => HistoryPostAction::RecordImmediate {
+            label: "Engine Link Follow Mode".to_owned(),
+        },
+        AppEvent::SelectEngineLinkDevice(_) => HistoryPostAction::RecordImmediate {
+            label: "Select Engine Device".to_owned(),
+        },
+        AppEvent::SetDmxBackend(_) => HistoryPostAction::RecordImmediate {
+            label: "DMX Backend".to_owned(),
+        },
+        AppEvent::SetDmxOutputEnabled(_) => HistoryPostAction::RecordImmediate {
+            label: "DMX Output Enabled".to_owned(),
+        },
+        AppEvent::SetDmxAutoConnect(_) => HistoryPostAction::RecordImmediate {
+            label: "DMX Auto Connect".to_owned(),
+        },
+        AppEvent::SetDmxBlackoutOnStop(_) => HistoryPostAction::RecordImmediate {
+            label: "DMX Blackout On Stop".to_owned(),
+        },
+        AppEvent::SelectDmxInterface(_) => HistoryPostAction::RecordImmediate {
+            label: "Select DMX Interface".to_owned(),
+        },
+        AppEvent::SetArtNetTarget(_) => HistoryPostAction::RecordImmediate {
+            label: "Art-Net Target".to_owned(),
+        },
+        AppEvent::SetArtNetUniverse(_) => HistoryPostAction::RecordImmediate {
+            label: "Art-Net Universe".to_owned(),
+        },
+        AppEvent::SetSacnTarget(_) => HistoryPostAction::RecordImmediate {
+            label: "sACN Target".to_owned(),
+        },
+        AppEvent::SetSacnUniverse(_) => HistoryPostAction::RecordImmediate {
+            label: "sACN Universe".to_owned(),
+        },
+        AppEvent::SetDmxRefreshRate(_) => HistoryPostAction::RecordImmediate {
+            label: "DMX Refresh Rate".to_owned(),
+        },
+        AppEvent::SetEnttecBreakMicros(_) => HistoryPostAction::RecordImmediate {
+            label: "ENTTEC Break".to_owned(),
+        },
+        AppEvent::SetEnttecMabMicros(_) => HistoryPostAction::RecordImmediate {
+            label: "ENTTEC MAB".to_owned(),
+        },
+        AppEvent::SelectMidiInput(_) => HistoryPostAction::RecordImmediate {
+            label: "Select MIDI Input".to_owned(),
+        },
+        AppEvent::SelectMidiOutput(_) => HistoryPostAction::RecordImmediate {
+            label: "Select MIDI Output".to_owned(),
+        },
+        AppEvent::SetMidiFeedbackEnabled(_) => HistoryPostAction::RecordImmediate {
+            label: "MIDI Feedback".to_owned(),
+        },
+        AppEvent::ApplyDetectedControllerAutomap => HistoryPostAction::RecordImmediate {
+            label: "Controller Automap".to_owned(),
+        },
+        AppEvent::ClearMidiBindings => HistoryPostAction::RecordImmediate {
+            label: "Clear MIDI Bindings".to_owned(),
+        },
+        AppEvent::CompleteMidiLearn(_) => HistoryPostAction::RecordImmediate {
+            label: "MIDI Learn".to_owned(),
+        },
+        AppEvent::RemoveMidiBinding(_) => HistoryPostAction::RecordImmediate {
+            label: "Remove MIDI Binding".to_owned(),
         },
         AppEvent::ApplyContextMenuAction(action) => match action {
             ContextMenuAction::Duplicate => HistoryPostAction::RecordImmediate {
@@ -2803,6 +4539,20 @@ fn prepare_history_action(state: &StudioState, event: &AppEvent) -> HistoryPostA
         | AppEvent::RestoreSelectedRecoverySlot
         | AppEvent::AutosaveRecoverySlot(_)
         | AppEvent::CreateNewVenture
+        | AppEvent::SelectSettingsTab(_)
+        | AppEvent::RefreshHardwareInventory
+        | AppEvent::ApplyHardwareInventory(_)
+        | AppEvent::HardwareInventoryFailed(_)
+        | AppEvent::RefreshEngineLinkDiscovery
+        | AppEvent::ApplyEngineLinkDiscoveryDevice(_)
+        | AppEvent::ApplyEngineLinkTelemetry(_)
+        | AppEvent::EngineLinkDiscoveryFailed(_)
+        | AppEvent::BeginRuntimeOutputDispatch(_)
+        | AppEvent::CompleteRuntimeOutputDispatch(_)
+        | AppEvent::RuntimeOutputDispatchFailed(_, _)
+        | AppEvent::StartMidiLearn(_)
+        | AppEvent::CancelMidiLearn
+        | AppEvent::ReceiveMidiRuntimeMessage(_)
         | AppEvent::CopySelectedClips
         | AppEvent::ToggleTransport
         | AppEvent::SetTimelineZoom(_)
@@ -2817,6 +4567,17 @@ fn prepare_history_action(state: &StudioState, event: &AppEvent) -> HistoryPostA
         | AppEvent::ReverseChase(_)
         | AppEvent::SelectFx(_)
         | AppEvent::SelectFixtureGroup(_)
+        | AppEvent::SetFixtureOflManufacturerKey(_)
+        | AppEvent::SetFixtureOflFixtureKey(_)
+        | AppEvent::SetFixtureQxfImportPath(_)
+        | AppEvent::SetFixtureQxfExportPath(_)
+        | AppEvent::RequestImportFixtureFromOfl
+        | AppEvent::RequestImportFixtureFromQxfPath
+        | AppEvent::SelectFixtureProfile(_)
+        | AppEvent::RequestExportSelectedFixtureAsQxf
+        | AppEvent::CompleteFixtureQxfExport(_)
+        | AppEvent::FixtureIoFailed(_)
+        | AppEvent::SelectFixturePatch(_)
         | AppEvent::OpenClipEditor(_)
         | AppEvent::CloseClipEditor
         | AppEvent::SetClipEditorAutomationTarget(_)
@@ -2864,7 +4625,14 @@ fn apply_revisions(revisions: &mut crate::core::RenderRevisionState, diffs: &[St
                 revisions.overlay += 1;
                 revisions.chrome += 1;
             }
-            StateDiff::Input | StateDiff::Clipboard | StateDiff::Venture => {
+            StateDiff::Input
+            | StateDiff::Clipboard
+            | StateDiff::Venture
+            | StateDiff::FixtureLibrary
+            | StateDiff::Settings
+            | StateDiff::Hardware
+            | StateDiff::EngineLink
+            | StateDiff::Output => {
                 revisions.chrome += 1;
             }
             StateDiff::Selection
@@ -3521,6 +5289,54 @@ mod tests {
     }
 
     #[test]
+    fn imported_fixture_profile_can_be_patched_and_edited() {
+        let mut state = StudioState::default();
+        let profile = demo_fixture_profile();
+
+        dispatch(
+            &mut state,
+            AppEvent::ApplyImportedFixtureProfile(profile.clone()),
+        );
+        dispatch(&mut state, AppEvent::CreateFixturePatch);
+        dispatch(&mut state, AppEvent::SetSelectedFixturePatchAddress(42));
+
+        assert_eq!(
+            state
+                .selected_fixture_profile()
+                .expect("selected fixture profile")
+                .id,
+            profile.id
+        );
+        assert_eq!(state.fixture_system.library.patches.len(), 1);
+        assert_eq!(
+            state
+                .selected_fixture_patch()
+                .expect("selected fixture patch")
+                .address,
+            42
+        );
+        assert!(state.can_undo());
+    }
+
+    #[test]
+    fn deleting_selected_fixture_profile_removes_dependent_patches() {
+        let mut state = StudioState::default();
+        let profile = demo_fixture_profile();
+
+        dispatch(
+            &mut state,
+            AppEvent::ApplyImportedFixtureProfile(profile.clone()),
+        );
+        dispatch(&mut state, AppEvent::CreateFixturePatch);
+        dispatch(&mut state, AppEvent::DeleteSelectedFixtureProfile);
+
+        assert!(state.fixture_system.library.profiles.is_empty());
+        assert!(state.fixture_system.library.patches.is_empty());
+        assert!(state.fixture_system.library.selected_profile.is_none());
+        assert!(state.fixture_system.library.selected_patch.is_none());
+    }
+
+    #[test]
     fn venture_save_as_and_delete_do_not_pollute_replay_log() {
         let mut state = StudioState::default();
         state.venture.directory = temp_venture_dir("venture-events")
@@ -3647,5 +5463,28 @@ mod tests {
                 .expect("unix time")
                 .as_nanos()
         ))
+    }
+
+    fn demo_fixture_profile() -> crate::core::FixtureProfile {
+        crate::core::import_ofl_fixture(
+            r#"{
+              "$schema":"https://raw.githubusercontent.com/OpenLightingProject/open-fixture-library/master/schemas/fixture.json",
+              "name":"Demo Wash 50",
+              "shortName":"DW50",
+              "categories":["Color Changer"],
+              "meta":{"authors":["Tester"],"createDate":"2024-01-01","lastModifyDate":"2024-01-02"},
+              "availableChannels":{
+                "Dimmer":{"defaultValue":0,"highlightValue":255,"capability":{"type":"Intensity"}},
+                "Red":{"capability":{"type":"ColorIntensity","color":"Red"}},
+                "Blue":{"capability":{"type":"ColorIntensity","color":"Blue"}}
+              },
+              "modes":[
+                {"name":"3ch","channels":["Dimmer","Red","Blue"]}
+              ]
+            }"#,
+            Some("demo"),
+            Some("demo-wash-50"),
+        )
+        .expect("fixture profile")
     }
 }

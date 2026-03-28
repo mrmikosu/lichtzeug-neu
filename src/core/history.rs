@@ -20,6 +20,7 @@ pub fn capture_history_snapshot(state: &StudioState) -> HistorySnapshot {
         chase_system: state.chase_system.clone(),
         fx_system: state.fx_system.clone(),
         fixture_system: state.fixture_system.clone(),
+        settings: state.settings.clone(),
     }
 }
 
@@ -126,6 +127,7 @@ pub fn restore_history_snapshot(state: &mut StudioState, snapshot: &HistorySnaps
     state.chase_system = snapshot.chase_system.clone();
     state.fx_system = snapshot.fx_system.clone();
     state.fixture_system = snapshot.fixture_system.clone();
+    state.settings = snapshot.settings.clone();
 }
 
 #[cfg(test)]

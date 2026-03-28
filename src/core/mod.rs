@@ -1,9 +1,13 @@
 mod automation;
 mod editor;
 mod engine;
+mod engine_link;
 mod event;
+mod fixtures;
+mod hardware;
 mod history;
 mod ids;
+mod output;
 mod project;
 mod queue;
 mod reducer;
@@ -26,13 +30,31 @@ pub use editor::{
     set_clip_editor_speed, toggle_clip_editor_automation_lane,
 };
 pub use engine::{advance_engine_frame, enter_sync_phase, resume_after_sync, toggle_transport};
+pub use engine_link::{
+    DEFAULT_STAGELINQ_DISCOVERY_PORT, merge_engine_device, parse_engine_discovery_packet,
+    select_followed_deck,
+};
 pub use event::{AppEvent, StateDiff, TimelineCursor, TimelineEvent, TimelineHit, TimelineZone};
+pub use fixtures::{
+    build_ofl_download_url, export_qxf_fixture, fixture_mode_channel_count,
+    fixture_patch_channel_count, import_ofl_fixture, import_qxf_fixture,
+};
+pub use hardware::{
+    controller_profile_bindings, controller_profile_from_name, decode_midi_bytes,
+    is_trigger_message_active, midi_control_hint, midi_port_id, midi_value_permille,
+    normalize_midi_binding_message, scan_dmx_interfaces, scan_hardware_inventory, scan_midi_ports,
+};
 pub use history::{
     apply_redo, apply_undo, begin_history_transaction, capture_history_snapshot,
     clear_pending_history, commit_history_transaction, record_history_entry,
     restore_history_snapshot,
 };
 pub use ids::{ChaseId, ClipId, CueId, FixtureGroupId, FxId, TrackId};
+pub use output::{
+    DmxUniverseFrame, MidiFeedbackMonitor, MidiFeedbackPacket, OutputDispatchFailure,
+    OutputMonitorSnapshot, OutputUniverseMonitor, RuntimeOutputSnapshot,
+    build_output_monitor_snapshot, build_runtime_output_snapshot, deliver_runtime_outputs,
+};
 pub use project::{
     ProjectFile, RecoveryRegistry, RecoverySlotFile, ReplayLogFile, VentureFile, VentureRegistry,
     delete_venture, ensure_venture_directory, export_project_json, export_replay_log_json,
@@ -58,17 +80,27 @@ pub use state::{
     AutomationInterpolation, AutomationLane, AutomationPoint, AutomationTarget, Chase,
     ChaseDirection, ChasePhase, ChaseStep, ChaseSystemState, Clip, ClipEditorPhase,
     ClipEditorState, ClipInlineParameterKind, ClipMarker, ClipPalette, ClipParameters, ClipPhase,
-    ClipboardClip, ClipboardState, ContextMenuAction, ContextMenuState, ContextMenuTarget, CpuLoad,
-    Cue, CuePhase, CueSystemState, CueVisualState, EngineErrorState, EnginePhase,
-    EngineResumeTarget, EngineState, FixtureGroup, FixturePhase, FixturePreviewNode,
-    FixtureSystemState, FxKind, FxLayer, FxPhase, FxSystemState, FxWaveform, HistoryEntry,
-    HistoryPhase, HistorySnapshot, HistoryState, HistoryTimelineSnapshot, HoverTarget,
-    InputModifiersState, PendingHistoryEntry, PerformanceState, RecoverySlotDescriptor,
-    RenderRevisionState, ReplayLogState, SelectionState, SnapGuide, SnapPhase, SnapResolution,
-    SnapState, StateLifecycle, StatusBarState, StudioState, TIMELINE_CLIP_HEIGHT_PX,
-    TIMELINE_CLIP_TOP_INSET_PX, TIMELINE_HEADER_HEIGHT_PX, TIMELINE_TRACK_GAP_PX,
-    TIMELINE_TRACK_HEIGHT_PX, TimelineInteraction, TimelinePhase, TimelineState, TimelineViewport,
-    Track, TransportState, VentureDescriptor, VenturePhase, VentureState,
+    ClipboardClip, ClipboardState, ContextMenuAction, ContextMenuState, ContextMenuTarget,
+    ControllerProfileKind, CpuLoad, Cue, CuePhase, CueSystemState, CueVisualState, DmxBackendKind,
+    DmxInterfaceDescriptor, DmxInterfaceKind, DmxSettingsState, EngineDeckFollowMode,
+    EngineDeckPhase, EngineDeckTelemetry, EngineErrorState, EngineLinkMode, EngineLinkPhase,
+    EngineLinkState, EngineMixerTelemetry, EnginePhase, EnginePrimeDevice, EngineResumeTarget,
+    EngineServiceDescriptor, EngineState, EngineTelemetryFrame, FixtureCapability, FixtureChannel,
+    FixtureGroup, FixtureGroupPatchSummary, FixtureLibraryPhase, FixtureLibraryState, FixtureMode,
+    FixturePatch, FixturePhase, FixturePhysical, FixturePreviewNode, FixtureProfile,
+    FixtureSourceInfo, FixtureSourceKind, FixtureSystemState, FixtureUniverseSummary, FxKind,
+    FxLayer, FxPhase, FxSystemState, FxWaveform, HardwareDiscoveryPhase, HardwareInventorySnapshot,
+    HistoryEntry, HistoryPhase, HistorySnapshot, HistoryState, HistoryTimelineSnapshot,
+    HoverTarget, InputModifiersState, MidiAction, MidiBinding, MidiBindingMessage, MidiControlHint,
+    MidiLearnPhase, MidiLearnState, MidiMessageKind, MidiPortDescriptor, MidiPortDirection,
+    MidiRuntimeMessage, MidiSettingsState, OutputDeliveryPhase, OutputDispatchReport,
+    OutputRuntimeState, PendingHistoryEntry, PerformanceState, RecoverySlotDescriptor,
+    RenderRevisionState, ReplayLogState, SelectionState, SettingsState, SettingsTab, SnapGuide,
+    SnapPhase, SnapResolution, SnapState, StateLifecycle, StatusBarState, StudioState,
+    TIMELINE_CLIP_HEIGHT_PX, TIMELINE_CLIP_TOP_INSET_PX, TIMELINE_HEADER_HEIGHT_PX,
+    TIMELINE_TRACK_GAP_PX, TIMELINE_TRACK_HEIGHT_PX, TimelineInteraction, TimelinePhase,
+    TimelineState, TimelineViewport, Track, TransportState, VentureDescriptor, VenturePhase,
+    VentureState,
 };
 pub use time::{
     BAR_BEATS, BeatTime, IntensityLevel, MonotonicClock, PPQ, RgbaColor, SpeedRatio, TempoBpm,

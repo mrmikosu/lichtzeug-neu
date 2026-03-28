@@ -73,7 +73,10 @@ pub fn foundation_spec() -> MachineReadableSection {
             "src/core/state.rs".to_owned(),
             "src/core/event.rs".to_owned(),
             "src/core/automation.rs".to_owned(),
+            "src/core/hardware.rs".to_owned(),
             "src/core/history.rs".to_owned(),
+            "src/core/engine_link.rs".to_owned(),
+            "src/core/output.rs".to_owned(),
             "src/core/project.rs".to_owned(),
             "src/core/queue.rs".to_owned(),
             "src/core/engine.rs".to_owned(),
@@ -94,6 +97,9 @@ pub fn foundation_spec() -> MachineReadableSection {
             module_automation_system(),
             module_clipboard_workflow(),
             module_venture_management(),
+            module_settings_hardware_system(),
+            module_engine_link_system(),
+            module_output_runtime_system(),
             module_persistence_replay(),
             module_engine(),
             module_timeline(),
@@ -292,6 +298,101 @@ pub fn foundation_spec() -> MachineReadableSection {
                 ],
             },
             FunctionSpec {
+                module: "SettingsHardwareSystem".to_owned(),
+                functions: vec![
+                    FunctionContractSpec {
+                        name: "scan_hardware_inventory".to_owned(),
+                        input_types: vec![],
+                        output_type: "Result<HardwareInventorySnapshot, String>".to_owned(),
+                        contract: ContractSpec {
+                            invariants: vec![
+                                "Hardware-Scans liefern deterministisch sortierte DMX- und MIDI-Descriptoren.".to_owned(),
+                                "Controller-Profile werden nur über typisierte Erkennungshinweise oder deterministische Namensheuristiken abgeleitet."
+                                    .to_owned(),
+                            ],
+                            pre_conditions: vec![
+                                "Das Host-System erlaubt den Zugriff auf verfügbare MIDI- und Serial-Port-Listen."
+                                    .to_owned(),
+                            ],
+                            post_conditions: vec![
+                                "Gleiche Portnamen und gleiche Reihenfolge erzeugen dieselbe Snapshot-Struktur."
+                                    .to_owned(),
+                            ],
+                        },
+                    },
+                    FunctionContractSpec {
+                        name: "apply_runtime_midi_message".to_owned(),
+                        input_types: vec![
+                            "&mut StudioState".to_owned(),
+                            "&MidiRuntimeMessage".to_owned(),
+                        ],
+                        output_type: "Vec<StateDiff>".to_owned(),
+                        contract: ContractSpec {
+                            invariants: vec![
+                                "MIDI-Runtime-Messages werden nur über gelernte, typisierte Bindings auf Actions gemappt."
+                                    .to_owned(),
+                                "Ungültige oder unbekannte Bindings bleiben side-effect-frei."
+                                    .to_owned(),
+                            ],
+                            pre_conditions: vec![
+                                "Learn-State und Binding-Registry sind validiert oder recoverable."
+                                    .to_owned(),
+                            ],
+                            post_conditions: vec![
+                                "Gleiche Messages und gleicher Ausgangs-State erzeugen dieselben Diffs und denselben Zielzustand."
+                                    .to_owned(),
+                            ],
+                        },
+                    },
+                ],
+            },
+            FunctionSpec {
+                module: "EngineLinkSystem".to_owned(),
+                functions: vec![
+                    FunctionContractSpec {
+                        name: "parse_engine_discovery_packet".to_owned(),
+                        input_types: vec!["&[u8]".to_owned(), "SocketAddr".to_owned()],
+                        output_type: "Option<EnginePrimeDevice>".to_owned(),
+                        contract: ContractSpec {
+                            invariants: vec![
+                                "Nur Discovery-Pakete mit erkennbarer StageLinq-Signatur werden in typsichere Device-Descriptoren überführt.".to_owned(),
+                                "Service- und Device-Listen werden deterministisch sortiert.".to_owned(),
+                            ],
+                            pre_conditions: vec![
+                                "Das Payload repräsentiert ein Discovery-Datagramm oder die Funktion liefert None."
+                                    .to_owned(),
+                            ],
+                            post_conditions: vec![
+                                "Gleiche Payload-Bytes und gleiche Source-Adresse erzeugen denselben Device-Descriptor."
+                                    .to_owned(),
+                            ],
+                        },
+                    },
+                    FunctionContractSpec {
+                        name: "select_followed_deck".to_owned(),
+                        input_types: vec![
+                            "&EngineTelemetryFrame".to_owned(),
+                            "EngineDeckFollowMode".to_owned(),
+                        ],
+                        output_type: "Option<&EngineDeckTelemetry>".to_owned(),
+                        contract: ContractSpec {
+                            invariants: vec![
+                                "Master-, Deck- und Any-Selection folgen einer festen Prioritätsreihenfolge."
+                                    .to_owned(),
+                            ],
+                            pre_conditions: vec![
+                                "Die Telemetrie enthält deterministisch sortierte Deck-Zustände."
+                                    .to_owned(),
+                            ],
+                            post_conditions: vec![
+                                "Die Auswahl für einen gegebenen Telemetrie-Frame bleibt deterministisch wiederholbar."
+                                    .to_owned(),
+                            ],
+                        },
+                    },
+                ],
+            },
+            FunctionSpec {
                 module: "PersistenceReplay".to_owned(),
                 functions: vec![FunctionContractSpec {
                     name: "export_project_json".to_owned(),
@@ -466,24 +567,46 @@ pub fn foundation_spec() -> MachineReadableSection {
             },
             FunctionSpec {
                 module: "FixtureSystem".to_owned(),
-                functions: vec![FunctionContractSpec {
-                    name: "select_fixture_group".to_owned(),
-                    input_types: vec![
-                        "&mut StudioState".to_owned(),
-                        "FixtureGroupId".to_owned(),
-                    ],
-                    output_type: "Vec<StateDiff>".to_owned(),
-                    contract: ContractSpec {
-                        invariants: vec![
-                            "Fixture-Ausgänge bleiben in 0..=1000.".to_owned(),
-                            "Fixture-Status folgt Cue- und FX-Quellen deterministisch.".to_owned(),
+                functions: vec![
+                    FunctionContractSpec {
+                        name: "select_fixture_group".to_owned(),
+                        input_types: vec![
+                            "&mut StudioState".to_owned(),
+                            "FixtureGroupId".to_owned(),
                         ],
-                        pre_conditions: vec!["FixtureGroupId existiert.".to_owned()],
-                        post_conditions: vec![
-                            "Die selektierte Fixture-Gruppe ist eindeutig gesetzt.".to_owned(),
-                        ],
+                        output_type: "Vec<StateDiff>".to_owned(),
+                        contract: ContractSpec {
+                            invariants: vec![
+                                "Fixture-Ausgänge bleiben in 0..=1000.".to_owned(),
+                                "Fixture-Status folgt Cue- und FX-Quellen deterministisch."
+                                    .to_owned(),
+                            ],
+                            pre_conditions: vec!["FixtureGroupId existiert.".to_owned()],
+                            post_conditions: vec![
+                                "Die selektierte Fixture-Gruppe ist eindeutig gesetzt."
+                                    .to_owned(),
+                            ],
+                        },
                     },
-                }],
+                    FunctionContractSpec {
+                        name: "fixture_universe_summaries".to_owned(),
+                        input_types: vec!["&StudioState".to_owned()],
+                        output_type: "Vec<FixtureUniverseSummary>".to_owned(),
+                        contract: ContractSpec {
+                            invariants: vec![
+                                "Universe-Summaries sind nach Universe-ID sortiert.".to_owned(),
+                                "Patch-Footprints und Overlaps werden deterministisch aus Profil, Mode und Adresse abgeleitet.".to_owned(),
+                            ],
+                            pre_conditions: vec![
+                                "Alle referenzierten Fixture-Profile fuer die Ableitung sind geladen."
+                                    .to_owned(),
+                            ],
+                            post_conditions: vec![
+                                "Occupied- und Footprint-Channels sind fuer gleiche Eingaben bitgenau reproduzierbar.".to_owned(),
+                            ],
+                        },
+                    },
+                ],
             },
         ],
     }
@@ -1022,6 +1145,200 @@ fn module_venture_management() -> ModuleSpec {
     }
 }
 
+fn module_settings_hardware_system() -> ModuleSpec {
+    ModuleSpec {
+        name: "SettingsHardwareSystem".to_owned(),
+        goal: "Deterministisches Settings-, DMX- und MIDI-Management inklusive Hardware-Discovery, MIDI Learn und Controller-Automap.".to_owned(),
+        fsm: FsmSpec {
+            states: vec![
+                "Idle".to_owned(),
+                "Discovering".to_owned(),
+                "Configured".to_owned(),
+                "Learning".to_owned(),
+                "Mapped".to_owned(),
+                "Error".to_owned(),
+            ],
+            transitions: vec![
+                transition("Idle", "Discovering", "RefreshHardwareInventory"),
+                transition("Discovering", "Configured", "ApplyHardwareInventory"),
+                transition("Configured", "Learning", "StartMidiLearn"),
+                transition("Configured", "Learning", "ApplyDetectedControllerAutomap"),
+                transition("Learning", "Mapped", "CompleteMidiLearn"),
+                transition("Learning", "Configured", "CancelMidiLearn"),
+                transition("Configured", "Mapped", "ReceiveMidiRuntimeMessage"),
+                transition("Discovering", "Error", "HardwareInventoryFailed"),
+            ],
+        },
+        state_type: "SettingsState".to_owned(),
+        input_type: "AppEvent::RefreshHardwareInventory | AppEvent::ApplyHardwareInventory | AppEvent::SetDmx* | AppEvent::SelectMidi* | AppEvent::StartMidiLearn | AppEvent::CompleteMidiLearn | AppEvent::ReceiveMidiRuntimeMessage".to_owned(),
+        output_type: "Vec<StateDiff>".to_owned(),
+        contracts: ContractSpec {
+            invariants: vec![
+                "Selektierte DMX- und MIDI-Ports referenzieren gültige Discovery-Descriptoren oder sind None.".to_owned(),
+                "ENTTEC Open DMX-Konfiguration bleibt auf gültige Timing- und Refresh-Ranges geklemmt.".to_owned(),
+                "MIDI-Bindings sind typisiert, eindeutig und replay-deterministisch.".to_owned(),
+                "Controller-Automaps erzeugen eine feste, profilabhängige Binding-Reihenfolge.".to_owned(),
+                "Controller-Profile wie APC40, Denon Prime 2 und CMD-Controller bleiben namentlich deterministisch erkennbar.".to_owned(),
+            ],
+            pre_conditions: vec![
+                "Hardware-Scan oder manuelle Auswahl liefern typisierte Port-Ids.".to_owned(),
+                "MIDI Learn benötigt einen selektierten Input oder bleibt no-op.".to_owned(),
+            ],
+            post_conditions: vec![
+                "Settings-, Hardware- und Runtime-MIDI-Zustände bleiben validierbar, serialisierbar und wiederholbar."
+                    .to_owned(),
+            ],
+        },
+        tests: vec![
+            "recovery_resets_missing_selected_midi_input_and_learn_state".to_owned(),
+            "recovery_deduplicates_midi_bindings".to_owned(),
+            "integration_settings_hardware_automap_replays_deterministically".to_owned(),
+            "controller_profile_detects_denon_prime_2_from_port_name".to_owned(),
+            "denon_prime_2_automap_blueprint_is_stable".to_owned(),
+            "integration_denon_prime_2_automap_replays_deterministically".to_owned(),
+        ],
+        implementation_files: vec![
+            "src/core/hardware.rs".to_owned(),
+            "src/core/state.rs".to_owned(),
+            "src/core/event.rs".to_owned(),
+            "src/core/reducer.rs".to_owned(),
+            "src/core/validation.rs".to_owned(),
+            "src/ui/mod.rs".to_owned(),
+            "src/app.rs".to_owned(),
+        ],
+        validation: validation_spec(),
+    }
+}
+
+fn module_engine_link_system() -> ModuleSpec {
+    ModuleSpec {
+        name: "EngineLinkSystem".to_owned(),
+        goal: "Deterministische Prime-/Engine-Session-Integration über StageLinq-Discovery, Device-Selektion und optionales Transport-Following.".to_owned(),
+        fsm: FsmSpec {
+            states: vec![
+                "Disabled".to_owned(),
+                "Idle".to_owned(),
+                "Discovering".to_owned(),
+                "DeviceSelected".to_owned(),
+                "Monitoring".to_owned(),
+                "Error".to_owned(),
+            ],
+            transitions: vec![
+                transition("Disabled", "Idle", "SetEngineLinkEnabled(true)"),
+                transition("Idle", "Discovering", "RefreshEngineLinkDiscovery"),
+                transition("Discovering", "DeviceSelected", "ApplyEngineLinkDiscoveryDevice"),
+                transition("DeviceSelected", "Monitoring", "ApplyEngineLinkTelemetry"),
+                transition("Monitoring", "Monitoring", "ApplyEngineLinkTelemetry"),
+                transition("Discovering", "Error", "EngineLinkDiscoveryFailed"),
+                transition("Monitoring", "Error", "EngineLinkDiscoveryFailed"),
+                transition("Idle", "Disabled", "SetEngineLinkEnabled(false)"),
+            ],
+        },
+        state_type: "EngineLinkState".to_owned(),
+        input_type: "AppEvent::SetEngineLink* | AppEvent::RefreshEngineLinkDiscovery | AppEvent::ApplyEngineLinkDiscoveryDevice | AppEvent::ApplyEngineLinkTelemetry".to_owned(),
+        output_type: "Vec<StateDiff>".to_owned(),
+        contracts: ContractSpec {
+            invariants: vec![
+                "Selektierte Engine-Devices referenzieren gültige Discovery-Descriptoren oder sind None.".to_owned(),
+                "Discovery-Port und Device-Liste bleiben typsicher und deterministisch sortiert.".to_owned(),
+                "Externe Telemetrie wird nur für das selektierte oder auto-verbundene Device übernommen.".to_owned(),
+                "Transport-Following aktualisiert BPM und Playhead ohne Undo-/Replay-Seiteneffekte."
+                    .to_owned(),
+            ],
+            pre_conditions: vec![
+                "StageLinq-Discovery liefert parsebare Datagramme oder bleibt side-effect-frei."
+                    .to_owned(),
+                "Telemetry-Following benötigt ein typisiertes Telemetry-Frame.".to_owned(),
+            ],
+            post_conditions: vec![
+                "Engine-Link-Zustand bleibt validierbar, serialisierbar und für gleiche Discovery-/Telemetry-Events reproduzierbar.".to_owned(),
+            ],
+        },
+        tests: vec![
+            "parse_json_discovery_packet_is_stable".to_owned(),
+            "parse_text_discovery_packet_extracts_prime_name_and_port".to_owned(),
+            "merge_engine_device_updates_in_place_deterministically".to_owned(),
+            "select_followed_deck_prefers_master_then_playing".to_owned(),
+            "recovery_resets_missing_selected_engine_device".to_owned(),
+            "integration_engine_link_discovery_and_transport_follow_replays_deterministically"
+                .to_owned(),
+        ],
+        implementation_files: vec![
+            "src/core/engine_link.rs".to_owned(),
+            "src/core/state.rs".to_owned(),
+            "src/core/event.rs".to_owned(),
+            "src/core/reducer.rs".to_owned(),
+            "src/core/validation.rs".to_owned(),
+            "src/ui/mod.rs".to_owned(),
+            "src/app.rs".to_owned(),
+        ],
+        validation: validation_spec(),
+    }
+}
+
+fn module_output_runtime_system() -> ModuleSpec {
+    ModuleSpec {
+        name: "OutputRuntimeSystem".to_owned(),
+        goal: "Deterministische DMX- und MIDI-Feedback-Ausgabe über ENTTEC Open DMX, Art-Net, sACN und gelernte MIDI-Targets.".to_owned(),
+        fsm: FsmSpec {
+            states: vec![
+                "Idle".to_owned(),
+                "SnapshotReady".to_owned(),
+                "Dispatching".to_owned(),
+                "Delivered".to_owned(),
+                "Error".to_owned(),
+            ],
+            transitions: vec![
+                transition("Idle", "SnapshotReady", "TickDue"),
+                transition("SnapshotReady", "Dispatching", "BeginRuntimeOutputDispatch"),
+                transition("Dispatching", "Delivered", "CompleteRuntimeOutputDispatch"),
+                transition("Dispatching", "Error", "RuntimeOutputDispatchFailed"),
+                transition("Delivered", "SnapshotReady", "TickDue"),
+            ],
+        },
+        state_type: "OutputRuntimeState".to_owned(),
+        input_type: "Tick | BeginRuntimeOutputDispatch | CompleteRuntimeOutputDispatch | RuntimeOutputDispatchFailed".to_owned(),
+        output_type: "RuntimeOutputSnapshot | OutputDispatchReport | OutputMonitorSnapshot".to_owned(),
+        contracts: ContractSpec {
+            invariants: vec![
+                "Output-Sequenzen steigen monoton.".to_owned(),
+                "DMX-Frames sind nach Universe/Adresse deterministisch sortiert.".to_owned(),
+                "MIDI-Feedback-Pakete folgen einer festen Binding-Reihenfolge.".to_owned(),
+                "Monitor-Universes und Segment-Level werden fuer gleichen State identisch abgeleitet.".to_owned(),
+                "Runtime-Dispatch verändert keine Authoring-History und kein Replay-Log.".to_owned(),
+            ],
+            pre_conditions: vec![
+                "Ein aktivierter Output-Route ist vollständig konfiguriert oder liefert einen expliziten Fehler.".to_owned(),
+                "Die Snapshot-Bildung verwendet nur validierten State.".to_owned(),
+            ],
+            post_conditions: vec![
+                "Dispatch-Berichte enthalten Backend, Sequenz und Paketanzahlen deterministisch.".to_owned(),
+                "Monitor-Snapshots enthalten geroutete Ziel-Labels und Segment-Pegel ohne versteckte Seiteneffekte.".to_owned(),
+                "Fehler enden in einem typisierten Error-State statt in stillen Seiteneffekten.".to_owned(),
+            ],
+        },
+        tests: vec![
+            "runtime_output_snapshot_renders_group_output_into_patched_universe".to_owned(),
+            "artnet_packet_encodes_universe_and_length_deterministically".to_owned(),
+            "sacn_packet_encodes_universe_and_property_count_deterministically".to_owned(),
+            "midi_feedback_packets_follow_learned_bindings_deterministically".to_owned(),
+            "output_snapshot_respects_refresh_rate_cadence".to_owned(),
+            "output_monitor_snapshot_summarizes_routing_and_segments".to_owned(),
+            "integration_runtime_output_snapshot_replays_deterministically".to_owned(),
+            "integration_output_monitor_snapshot_is_deterministic".to_owned(),
+        ],
+        implementation_files: vec![
+            "src/core/output.rs".to_owned(),
+            "src/core/state.rs".to_owned(),
+            "src/core/event.rs".to_owned(),
+            "src/core/reducer.rs".to_owned(),
+            "src/app.rs".to_owned(),
+            "src/ui/mod.rs".to_owned(),
+        ],
+        validation: validation_spec(),
+    }
+}
+
 fn module_engine() -> ModuleSpec {
     ModuleSpec {
         name: "Engine".to_owned(),
@@ -1377,7 +1694,7 @@ fn module_fx_system() -> ModuleSpec {
 fn module_fixture_system() -> ModuleSpec {
     ModuleSpec {
         name: "FixtureSystem".to_owned(),
-        goal: "Deterministisch abgeleitete Fixture-Gruppenstatus aus Cue- und FX-Quellen."
+        goal: "Deterministisch abgeleitete Fixture-Gruppenstatus, Patch-Mappings und DMX-Universe-Belegung."
             .to_owned(),
         fsm: FsmSpec {
             states: vec![
@@ -1402,23 +1719,30 @@ fn module_fixture_system() -> ModuleSpec {
                 "online <= fixture_count".to_owned(),
                 "Fixture-Ausgang bleibt normiert.".to_owned(),
                 "Preview-Nodes liegen in einem normierten 2.5D-Raum.".to_owned(),
-                "Canvas-Hit-Testing selektiert deterministisch genau eine Fixture-Gruppe."
+                "Canvas-Hit-Testing selektiert deterministisch genau eine Fixture-Gruppe oder genau einen Fixture-Patch."
+                    .to_owned(),
+                "DMX-Universes und Patch-Footprints werden fuer gleiche Profile und Modi identisch rekonstruiert."
                     .to_owned(),
             ],
             pre_conditions: vec!["FixtureGroupId ist gültig.".to_owned()],
             post_conditions: vec![
                 "Fixture-Phase entspricht deterministisch der Source-Situation.".to_owned(),
+                "Patch- und Universe-Summaries spiegeln die sichtbare Stage-Zuordnung verlustfrei wider."
+                    .to_owned(),
             ],
         },
         tests: vec![
             "fixture_group_becomes_active_from_linked_sources".to_owned(),
             "scenario_fixture_selection_stays_valid_after_show_updates".to_owned(),
             "integration_fx_waveform_and_fixture_preview_replay_is_deterministic".to_owned(),
+            "integration_fixture_patch_stage_summaries_are_deterministic".to_owned(),
             "replay_produces_identical_show_state_snapshot".to_owned(),
             "group_hit_test_selects_fixture_from_projected_node_space".to_owned(),
+            "patch_hit_test_prioritizes_fixture_patch_chip".to_owned(),
         ],
         implementation_files: vec![
             "src/core/state.rs".to_owned(),
+            "src/core/fixtures.rs".to_owned(),
             "src/core/show.rs".to_owned(),
             "src/core/validation.rs".to_owned(),
             "src/ui/mod.rs".to_owned(),
@@ -1445,6 +1769,24 @@ mod tests {
         let json = foundation_spec_json();
         let parsed: MachineReadableSection =
             serde_json::from_str(&json).expect("spec parses as json");
-        assert_eq!(parsed.modules.len(), 16);
+        assert_eq!(parsed.modules.len(), 19);
+        assert!(
+            parsed
+                .modules
+                .iter()
+                .any(|module| module.name == "SettingsHardwareSystem")
+        );
+        assert!(
+            parsed
+                .modules
+                .iter()
+                .any(|module| module.name == "EngineLinkSystem")
+        );
+        assert!(
+            parsed
+                .modules
+                .iter()
+                .any(|module| module.name == "OutputRuntimeSystem")
+        );
     }
 }

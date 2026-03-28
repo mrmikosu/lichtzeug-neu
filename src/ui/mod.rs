@@ -4,13 +4,17 @@ pub mod timeline;
 
 use crate::core::{
     AppEvent, BeatTime, Chase, ChaseDirection, ChasePhase, ContextMenuAction, ContextMenuTarget,
-    Cue, CueId, CuePhase, FixtureGroup, FixturePhase, FxKind, FxLayer, FxPhase, FxWaveform,
-    RgbaColor, SelectionState, StudioState, Track,
+    ControllerProfileKind, Cue, CueId, CuePhase, DmxBackendKind, DmxInterfaceKind,
+    EngineDeckFollowMode, EngineDeckPhase, EngineLinkMode, EnginePrimeDevice, FixtureGroup,
+    FixtureGroupId, FixturePatch, FixturePhase, FxKind, FxLayer, FxPhase, FxWaveform, MidiAction,
+    MidiBinding, MidiBindingMessage, MidiControlHint, MidiLearnPhase, MidiMessageKind,
+    MidiPortDescriptor, OutputUniverseMonitor, RgbaColor, SelectionState, SettingsTab, StudioState,
+    Track, build_output_monitor_snapshot,
 };
 use iced::widget::{
     button, column, container, pick_list, row, scrollable, slider, text, text_input,
 };
-use iced::{Alignment, Element, Length, Theme};
+use iced::{Alignment, Color, Element, Length, Theme};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +48,90 @@ struct ColorChoice {
 }
 
 impl fmt::Display for ColorChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FixtureGroupChoice {
+    id: Option<FixtureGroupId>,
+    label: String,
+}
+
+impl fmt::Display for FixtureGroupChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SettingsTabChoice {
+    value: SettingsTab,
+    label: &'static str,
+}
+
+impl fmt::Display for SettingsTabChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DmxBackendChoice {
+    value: DmxBackendKind,
+    label: &'static str,
+}
+
+impl fmt::Display for DmxBackendChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EngineLinkModeChoice {
+    value: EngineLinkMode,
+    label: &'static str,
+}
+
+impl fmt::Display for EngineLinkModeChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EngineDeckFollowChoice {
+    value: EngineDeckFollowMode,
+    label: &'static str,
+}
+
+impl fmt::Display for EngineDeckFollowChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EngineDeviceChoice {
+    id: Option<String>,
+    label: String,
+}
+
+impl fmt::Display for EngineDeviceChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PortChoice {
+    id: Option<String>,
+    label: String,
+}
+
+impl fmt::Display for PortChoice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.label)
     }
@@ -128,6 +216,194 @@ fn color_choices(current: Option<RgbaColor>) -> Vec<ColorChoice> {
 
 fn selected_color_choice(options: &[ColorChoice], value: RgbaColor) -> Option<ColorChoice> {
     options.iter().find(|option| option.value == value).cloned()
+}
+
+fn fixture_group_choices(state: &StudioState) -> Vec<FixtureGroupChoice> {
+    let mut options = vec![FixtureGroupChoice {
+        id: None,
+        label: "No Preview Group".to_owned(),
+    }];
+    options.extend(
+        state
+            .fixture_system
+            .groups
+            .iter()
+            .map(|group| FixtureGroupChoice {
+                id: Some(group.id),
+                label: format!("{} ({})", group.name, group.id.0),
+            }),
+    );
+    options
+}
+
+fn selected_fixture_group_choice(
+    options: &[FixtureGroupChoice],
+    group_id: Option<FixtureGroupId>,
+) -> Option<FixtureGroupChoice> {
+    options.iter().find(|option| option.id == group_id).cloned()
+}
+
+fn settings_tab_choices() -> [SettingsTabChoice; 5] {
+    [
+        SettingsTabChoice {
+            value: SettingsTab::General,
+            label: "General",
+        },
+        SettingsTabChoice {
+            value: SettingsTab::Dmx,
+            label: "DMX",
+        },
+        SettingsTabChoice {
+            value: SettingsTab::Midi,
+            label: "MIDI",
+        },
+        SettingsTabChoice {
+            value: SettingsTab::Controllers,
+            label: "Controllers",
+        },
+        SettingsTabChoice {
+            value: SettingsTab::Engine,
+            label: "Engine",
+        },
+    ]
+}
+
+fn engine_link_mode_choices() -> [EngineLinkModeChoice; 2] {
+    [
+        EngineLinkModeChoice {
+            value: EngineLinkMode::Disabled,
+            label: "Disabled",
+        },
+        EngineLinkModeChoice {
+            value: EngineLinkMode::StageLinqExperimental,
+            label: "StageLinq Experimental",
+        },
+    ]
+}
+
+fn engine_follow_choices() -> [EngineDeckFollowChoice; 5] {
+    [
+        EngineDeckFollowChoice {
+            value: EngineDeckFollowMode::Disabled,
+            label: "Disabled",
+        },
+        EngineDeckFollowChoice {
+            value: EngineDeckFollowMode::Deck1,
+            label: "Deck 1",
+        },
+        EngineDeckFollowChoice {
+            value: EngineDeckFollowMode::Deck2,
+            label: "Deck 2",
+        },
+        EngineDeckFollowChoice {
+            value: EngineDeckFollowMode::MasterDeck,
+            label: "Master Deck",
+        },
+        EngineDeckFollowChoice {
+            value: EngineDeckFollowMode::AnyPlayingDeck,
+            label: "Any Playing Deck",
+        },
+    ]
+}
+
+fn engine_device_choices(state: &StudioState) -> Vec<EngineDeviceChoice> {
+    let mut options = vec![EngineDeviceChoice {
+        id: None,
+        label: "Auto / No Device".to_owned(),
+    }];
+    options.extend(
+        state
+            .settings
+            .engine_link
+            .devices
+            .iter()
+            .map(|device| EngineDeviceChoice {
+                id: Some(device.id.clone()),
+                label: format!("{} ({})", device.name, device.address),
+            }),
+    );
+    options
+}
+
+fn selected_engine_device_choice(
+    options: &[EngineDeviceChoice],
+    device_id: Option<&str>,
+) -> Option<EngineDeviceChoice> {
+    options
+        .iter()
+        .find(|option| option.id.as_deref() == device_id)
+        .cloned()
+}
+
+fn dmx_backend_choices() -> [DmxBackendChoice; 4] {
+    [
+        DmxBackendChoice {
+            value: DmxBackendKind::Disabled,
+            label: "Disabled",
+        },
+        DmxBackendChoice {
+            value: DmxBackendKind::EnttecOpenDmx,
+            label: "ENTTEC Open DMX",
+        },
+        DmxBackendChoice {
+            value: DmxBackendKind::ArtNet,
+            label: "Art-Net",
+        },
+        DmxBackendChoice {
+            value: DmxBackendKind::Sacn,
+            label: "sACN",
+        },
+    ]
+}
+
+fn dmx_interface_choices(state: &StudioState) -> Vec<PortChoice> {
+    let mut options = vec![PortChoice {
+        id: None,
+        label: "No Interface".to_owned(),
+    }];
+    options.extend(
+        state
+            .settings
+            .dmx
+            .interfaces
+            .iter()
+            .map(|interface| PortChoice {
+                id: Some(interface.id.clone()),
+                label: format!("{}  |  {}", interface.name, interface.detail),
+            }),
+    );
+    options
+}
+
+fn midi_port_choices(ports: &[MidiPortDescriptor], empty_label: &str) -> Vec<PortChoice> {
+    let mut options = vec![PortChoice {
+        id: None,
+        label: empty_label.to_owned(),
+    }];
+    options.extend(ports.iter().map(|port| PortChoice {
+        id: Some(port.id.clone()),
+        label: port.detail.clone(),
+    }));
+    options
+}
+
+fn selected_port_choice(options: &[PortChoice], id: Option<&str>) -> Option<PortChoice> {
+    options
+        .iter()
+        .find(|option| option.id.as_deref() == id)
+        .cloned()
+}
+
+fn format_universe_labels(universes: &[u16]) -> String {
+    if universes.is_empty() {
+        "No universes".to_owned()
+    } else {
+        universes
+            .iter()
+            .map(|universe| format!("U{}", universe))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 pub fn view(state: &StudioState) -> Element<'_, AppEvent> {
@@ -735,6 +1011,10 @@ fn right_panel(state: &StudioState) -> Element<'_, AppEvent> {
         .padding(14)
         .style(|_| theme::panel_subtle());
 
+    let settings = container(settings_panel(state))
+        .padding(14)
+        .style(|_| theme::panel_tinted(theme::accent_playhead()));
+
     let mut cues_content = column![
         panel_header("Cues", "Stored / Armed / Active"),
         text(
@@ -852,11 +1132,12 @@ fn right_panel(state: &StudioState) -> Element<'_, AppEvent> {
         .style(|_| theme::panel_subtle());
 
     let mut fixture_content = column![
-        panel_header("Fixture View", "Mapped / Active / Error"),
+        panel_header("Fixture View", "Library / Patch / Preview"),
+        fixture_management_panel(state),
         text(
             state
                 .selected_fixture_group()
-                .map(|group| format!("Selected: {}", group.name))
+                .map(|group| format!("Preview: {}", group.name))
                 .unwrap_or_else(|| "Keine Fixture-Gruppe selektiert.".to_owned()),
         )
         .size(12)
@@ -867,6 +1148,7 @@ fn right_panel(state: &StudioState) -> Element<'_, AppEvent> {
     for group in &state.fixture_system.groups {
         fixture_content = fixture_content.push(fixture_row(
             group,
+            state,
             state.fixture_system.selected == Some(group.id),
         ));
     }
@@ -875,12 +1157,1144 @@ fn right_panel(state: &StudioState) -> Element<'_, AppEvent> {
         .style(|_| theme::panel_subtle());
 
     container(
-        scrollable(column![venture, clip_editor, context, cues, chases, fx, fixture].spacing(12))
-            .height(Length::Fill),
+        scrollable(
+            column![
+                venture,
+                settings,
+                clip_editor,
+                context,
+                cues,
+                chases,
+                fx,
+                fixture
+            ]
+            .spacing(12),
+        )
+        .height(Length::Fill),
     )
     .padding(12)
     .style(|_| theme::panel())
     .height(Length::Fill)
+    .into()
+}
+
+fn settings_panel(state: &StudioState) -> Element<'_, AppEvent> {
+    let tab_bar = row(settings_tab_choices()
+        .into_iter()
+        .map(|choice| {
+            let is_active = state.settings.selected_tab == choice.value;
+            button(text(choice.label))
+                .padding([6, 10])
+                .style(move |_: &Theme, status| {
+                    theme::toggle_button(status, is_active, theme::accent_playhead())
+                })
+                .on_press(AppEvent::SelectSettingsTab(choice.value))
+                .into()
+        })
+        .collect::<Vec<Element<'_, AppEvent>>>())
+    .spacing(8)
+    .align_y(Alignment::Center);
+
+    let refresh_button = {
+        let button =
+            button(text("Refresh Hardware"))
+                .padding([8, 12])
+                .style(move |_: &Theme, status| {
+                    theme::toggle_button(
+                        status,
+                        state.can_refresh_hardware_inventory(),
+                        theme::accent_blue(),
+                    )
+                });
+        if state.can_refresh_hardware_inventory() {
+            button.on_press(AppEvent::RefreshHardwareInventory)
+        } else {
+            button
+        }
+    };
+
+    let summary = container(
+        column![
+            text(format!(
+                "{} DMX  |  {} MIDI In  |  {} MIDI Out  |  {} Engine",
+                state.settings.dmx.interfaces.len(),
+                state.settings.midi.inputs.len(),
+                state.settings.midi.outputs.len(),
+                state.settings.engine_link.devices.len()
+            ))
+            .size(12)
+            .color(theme::text_muted()),
+            text(
+                state
+                    .output
+                    .last_summary
+                    .clone()
+                    .or_else(|| state.settings.engine_link.last_summary.clone())
+                    .clone()
+                    .or_else(|| state.settings.midi.last_summary.clone())
+                    .or_else(|| state.settings.dmx.last_summary.clone())
+                    .unwrap_or_else(|| "Hardware-Status bereit.".to_owned())
+            )
+            .size(12)
+            .color(theme::text_primary()),
+        ]
+        .spacing(6),
+    )
+    .padding([8, 10])
+    .style(|_| theme::panel_inner());
+
+    let content = match state.settings.selected_tab {
+        SettingsTab::General => general_settings_panel(state),
+        SettingsTab::Dmx => dmx_settings_panel(state),
+        SettingsTab::Midi => midi_settings_panel(state),
+        SettingsTab::Controllers => controller_settings_panel(state),
+        SettingsTab::Engine => engine_settings_panel(state),
+    };
+
+    column![
+        panel_header("Settings", "System / DMX / MIDI / Controllers / Engine"),
+        row![refresh_button].align_y(Alignment::Center),
+        tab_bar,
+        summary,
+        content,
+    ]
+    .spacing(10)
+    .into()
+}
+
+fn general_settings_panel(state: &StudioState) -> Element<'_, AppEvent> {
+    let toggles = column![
+        settings_toggle_button(
+            "FPS Overlay",
+            state.settings.show_fps_overlay,
+            AppEvent::SetShowFpsOverlay(!state.settings.show_fps_overlay),
+            theme::success(),
+        ),
+        settings_toggle_button(
+            "CPU Overlay",
+            state.settings.show_cpu_overlay,
+            AppEvent::SetShowCpuOverlay(!state.settings.show_cpu_overlay),
+            theme::warning(),
+        ),
+        settings_toggle_button(
+            "Smooth Playhead",
+            state.settings.smooth_playhead,
+            AppEvent::SetSmoothPlayhead(!state.settings.smooth_playhead),
+            theme::accent_playhead(),
+        ),
+        settings_toggle_button(
+            "Follow Playhead",
+            state.settings.follow_playhead,
+            AppEvent::SetFollowPlayhead(!state.settings.follow_playhead),
+            theme::accent_blue(),
+        ),
+    ]
+    .spacing(8);
+
+    let runtime = container(
+        column![
+            text("Runtime").size(12).color(theme::text_muted()),
+            text(format!(
+                "Frame {}  |  {} FPS  |  CPU {}%  |  Budget {} ms",
+                state.performance.frame_index,
+                state.performance.fps,
+                state.performance.cpu_load.0,
+                state.performance.frame_budget_ms
+            ))
+            .size(12)
+            .color(theme::text_primary()),
+            text(format!(
+                "Transport: {}  |  Zoom {:.2}x",
+                state.engine.transport.position_label(),
+                state.timeline.viewport.zoom.as_f32()
+            ))
+            .size(12)
+            .color(theme::text_muted()),
+        ]
+        .spacing(6),
+    )
+    .padding([8, 10])
+    .style(|_| theme::panel_inner());
+
+    column![toggles, runtime, output_runtime_card(state)]
+        .spacing(10)
+        .into()
+}
+
+fn output_runtime_card(state: &StudioState) -> Element<'_, AppEvent> {
+    let summary = state
+        .output
+        .last_summary
+        .clone()
+        .unwrap_or_else(|| "Noch kein Output-Dispatch".to_owned());
+    let error = state
+        .output
+        .last_error
+        .clone()
+        .unwrap_or_else(|| "Kein Output-Fehler".to_owned());
+    let backend = dmx_backend_choices()
+        .into_iter()
+        .find(|choice| choice.value == state.output.last_backend)
+        .map(|choice| choice.label)
+        .unwrap_or("Disabled");
+
+    container(
+        column![
+            text("Output Runtime").size(12).color(theme::text_muted()),
+            text(format!(
+                "Phase: {}  |  Seq {}",
+                output_phase_label(state.output.phase),
+                state.output.sequence
+            ))
+            .size(12)
+            .color(theme::text_primary()),
+            text(format!(
+                "Backend: {}  |  {} DMX frame(s)  |  {} MIDI message(s)",
+                backend, state.output.last_dmx_frame_count, state.output.last_midi_message_count
+            ))
+            .size(11)
+            .color(theme::text_muted()),
+            text(summary).size(11).color(theme::text_primary()),
+            text(error)
+                .size(11)
+                .color(if state.output.last_error.is_some() {
+                    theme::warning()
+                } else {
+                    theme::text_muted()
+                }),
+        ]
+        .spacing(6),
+    )
+    .padding([8, 10])
+    .style(|_| theme::panel_inner())
+    .into()
+}
+
+fn dmx_output_monitor_panel(state: &StudioState) -> Element<'_, AppEvent> {
+    let monitor = build_output_monitor_snapshot(state);
+    let header = match monitor.backend {
+        DmxBackendKind::Disabled => "Preview only, DMX backend disabled".to_owned(),
+        DmxBackendKind::EnttecOpenDmx => "ENTTEC Open DMX live monitor".to_owned(),
+        DmxBackendKind::ArtNet => format!(
+            "Art-Net live monitor @ {}",
+            state.settings.dmx.artnet_target
+        ),
+        DmxBackendKind::Sacn => format!("sACN live monitor @ {}", state.settings.dmx.sacn_target),
+    };
+
+    let mut content = column![
+        text("DMX Monitor").size(12).color(theme::text_muted()),
+        text(header).size(12).color(theme::text_primary()),
+        text(if monitor.blackout_applied {
+            "Blackout On Stop ist aktiv, Universes zeigen aktuell Null-Frames."
+        } else {
+            "Aktuelle gerenderte Slot-Pegel aus Engine und Fixture-Patches."
+        })
+        .size(11)
+        .color(theme::text_muted()),
+    ]
+    .spacing(8);
+
+    if monitor.universe_monitors.is_empty() {
+        content = content.push(
+            container(text("Keine gepatchten oder gerenderten DMX-Universes."))
+                .padding([8, 10])
+                .style(|_| theme::panel_subtle()),
+        );
+    } else {
+        for universe in monitor.universe_monitors.clone() {
+            content = content.push(output_universe_monitor_card(universe));
+        }
+    }
+
+    container(content)
+        .padding([10, 12])
+        .style(|_| theme::panel_inner())
+        .into()
+}
+
+fn midi_feedback_monitor_panel(state: &StudioState) -> Element<'_, AppEvent> {
+    let monitor = build_output_monitor_snapshot(state);
+    let output_label = state
+        .selected_midi_output()
+        .map(|port| port.name.clone())
+        .unwrap_or_else(|| "No MIDI Output".to_owned());
+
+    let mut content = column![
+        text("MIDI Feedback Monitor")
+            .size(12)
+            .color(theme::text_muted()),
+        text(format!("Output: {}", output_label))
+            .size(12)
+            .color(theme::text_primary()),
+    ]
+    .spacing(8);
+
+    if monitor.midi_feedback_monitors.is_empty() {
+        content = content.push(
+            container(text("Keine gelernten MIDI-Feedback-Bindings vorhanden."))
+                .padding([8, 10])
+                .style(|_| theme::panel_subtle()),
+        );
+    } else {
+        for binding in monitor.midi_feedback_monitors.clone() {
+            content = content.push(midi_feedback_monitor_card(binding));
+        }
+    }
+
+    container(content)
+        .padding([10, 12])
+        .style(|_| theme::panel_inner())
+        .into()
+}
+
+fn midi_feedback_monitor_card(
+    binding: crate::core::MidiFeedbackMonitor,
+) -> Element<'static, AppEvent> {
+    let accent = if binding.active {
+        theme::success()
+    } else {
+        theme::muted_chip()
+    };
+
+    container(
+        row![
+            container(text(""))
+                .width(Length::Fixed(8.0))
+                .style(move |_| theme::color_bar(accent)),
+            column![
+                text(binding.label).size(13).color(theme::text_primary()),
+                text(format!(
+                    "{}  |  {:>3}%",
+                    binding.message,
+                    ((binding.value as u32 * 100) / 16_383)
+                ))
+                .size(11)
+                .color(theme::text_muted()),
+            ]
+            .spacing(4)
+            .width(Length::Fill),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .padding([8, 10])
+    .style(move |_| theme::track_card(accent, binding.active))
+    .into()
+}
+
+fn output_universe_monitor_card(universe: OutputUniverseMonitor) -> Element<'static, AppEvent> {
+    let internal_universe = universe.internal_universe;
+    let destination = universe.destination;
+    let patch_count = universe.patch_count;
+    let enabled_patch_count = universe.enabled_patch_count;
+    let occupied_channels = universe.occupied_channels;
+    let active_slots = universe.active_slots;
+    let peak_value = universe.peak_value;
+    let segment_levels = universe.segment_levels;
+    let patch_labels = universe.patch_labels;
+
+    let active = peak_value > 0;
+    let accent = if active {
+        output_segment_color(segment_levels.iter().copied().max().unwrap_or(0))
+    } else {
+        theme::muted_chip()
+    };
+
+    container(
+        column![
+            row![
+                text(format!("U{}", internal_universe))
+                    .size(14)
+                    .color(theme::text_primary()),
+                text(destination).size(12).color(theme::text_muted()),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+            text(format!(
+                "{} patch(es)  |  {} enabled  |  {} occupied ch  |  {} active slot(s)  |  peak {}",
+                patch_count, enabled_patch_count, occupied_channels, active_slots, peak_value
+            ))
+            .size(12)
+            .color(theme::text_primary()),
+            output_segment_strip(segment_levels),
+            text(if patch_labels.is_empty() {
+                "Keine Patch-Namen in diesem Universe.".to_owned()
+            } else {
+                format!("Patches: {}", patch_labels.join(", "))
+            })
+            .size(11)
+            .color(theme::text_muted()),
+        ]
+        .spacing(6),
+    )
+    .padding([8, 10])
+    .style(move |_| theme::track_card(accent, active))
+    .into()
+}
+
+fn output_segment_strip(levels: Vec<u16>) -> Element<'static, AppEvent> {
+    row(levels
+        .into_iter()
+        .map(|level| {
+            container(text(" "))
+                .width(Length::FillPortion(1))
+                .height(Length::Fixed(8.0))
+                .style(move |_| theme::color_bar(output_segment_color(level)))
+                .into()
+        })
+        .collect::<Vec<Element<'static, AppEvent>>>())
+    .spacing(3)
+    .into()
+}
+
+fn output_segment_color(level: u16) -> Color {
+    match level {
+        901..=1000 => theme::success(),
+        601..=900 => theme::accent_blue(),
+        301..=600 => theme::warning(),
+        1..=300 => theme::muted_chip(),
+        _ => Color::from_rgba8(63, 74, 87, 0.2),
+    }
+}
+
+fn dmx_settings_panel(state: &StudioState) -> Element<'_, AppEvent> {
+    let backend_bar = row(dmx_backend_choices()
+        .into_iter()
+        .map(|choice| {
+            let is_active = state.settings.dmx.backend == choice.value;
+            button(text(choice.label))
+                .padding([6, 10])
+                .style(move |_: &Theme, status| {
+                    theme::toggle_button(status, is_active, theme::accent_blue())
+                })
+                .on_press(AppEvent::SetDmxBackend(choice.value))
+                .into()
+        })
+        .collect::<Vec<Element<'_, AppEvent>>>())
+    .spacing(8)
+    .align_y(Alignment::Center);
+
+    let interface_choices = dmx_interface_choices(state);
+    let selected_interface = selected_port_choice(
+        &interface_choices,
+        state.settings.dmx.selected_interface.as_deref(),
+    );
+
+    let mut content = column![
+        backend_bar,
+        settings_toggle_button(
+            "DMX Output Enabled",
+            state.settings.dmx.output_enabled,
+            AppEvent::SetDmxOutputEnabled(!state.settings.dmx.output_enabled),
+            theme::success(),
+        ),
+        settings_toggle_button(
+            "Auto Connect",
+            state.settings.dmx.auto_connect,
+            AppEvent::SetDmxAutoConnect(!state.settings.dmx.auto_connect),
+            theme::accent_playhead(),
+        ),
+        settings_toggle_button(
+            "Blackout On Stop",
+            state.settings.dmx.blackout_on_stop,
+            AppEvent::SetDmxBlackoutOnStop(!state.settings.dmx.blackout_on_stop),
+            theme::warning(),
+        ),
+        column![
+            text("Interface").size(12).color(theme::text_muted()),
+            pick_list(interface_choices, selected_interface, |choice| {
+                AppEvent::SelectDmxInterface(choice.id)
+            })
+            .placeholder("DMX Interface wählen"),
+        ]
+        .spacing(6),
+        column![
+            text(format!(
+                "Refresh Rate: {} Hz",
+                state.settings.dmx.refresh_rate_hz
+            ))
+            .size(12)
+            .color(theme::text_muted()),
+            slider(
+                1..=44,
+                state.settings.dmx.refresh_rate_hz,
+                AppEvent::SetDmxRefreshRate
+            ),
+        ]
+        .spacing(6),
+    ]
+    .spacing(10);
+
+    if let Some(interface) = state.selected_dmx_interface() {
+        content = content.push(
+            container(
+                column![
+                    text(&interface.name).size(13).color(theme::text_primary()),
+                    text(format!(
+                        "{}  |  {}",
+                        dmx_interface_kind_label(interface.kind),
+                        interface.detail
+                    ))
+                    .size(11)
+                    .color(theme::text_muted()),
+                ]
+                .spacing(4),
+            )
+            .padding([8, 10])
+            .style(|_| theme::panel_inner()),
+        );
+    }
+
+    match state.settings.dmx.backend {
+        DmxBackendKind::EnttecOpenDmx => {
+            content = content
+                .push(
+                    container(
+                        column![
+                            text("ENTTEC Open DMX").size(12).color(theme::text_muted()),
+                            text(
+                                "Output-only Interface, 1 Universe / 512 Channels, Break/MAB timing ist direkt konfigurierbar."
+                            )
+                            .size(12)
+                            .color(theme::text_primary()),
+                        ]
+                        .spacing(6),
+                    )
+                    .padding([8, 10])
+                    .style(|_| theme::panel_inner()),
+                )
+                .push(
+                    column![
+                        text(format!(
+                            "Break: {} µs",
+                            state.settings.dmx.enttec_break_us
+                        ))
+                        .size(12)
+                        .color(theme::text_muted()),
+                        slider(
+                            88..=1000,
+                            state.settings.dmx.enttec_break_us,
+                            AppEvent::SetEnttecBreakMicros,
+                        ),
+                    ]
+                    .spacing(6),
+                )
+                .push(
+                    column![
+                        text(format!(
+                            "Mark After Break: {} µs",
+                            state.settings.dmx.enttec_mark_after_break_us
+                        ))
+                        .size(12)
+                        .color(theme::text_muted()),
+                        slider(
+                            8..=1000,
+                            state.settings.dmx.enttec_mark_after_break_us,
+                            AppEvent::SetEnttecMabMicros,
+                        ),
+                    ]
+                    .spacing(6),
+                );
+        }
+        DmxBackendKind::ArtNet => {
+            content = content.push(
+                column![
+                    text_input("Art-Net Target", &state.settings.dmx.artnet_target)
+                        .on_input(AppEvent::SetArtNetTarget)
+                        .padding([8, 10]),
+                    text(format!(
+                        "Art-Net Universe: {}",
+                        state.settings.dmx.artnet_universe
+                    ))
+                    .size(12)
+                    .color(theme::text_muted()),
+                    slider(
+                        1..=64,
+                        state.settings.dmx.artnet_universe,
+                        AppEvent::SetArtNetUniverse
+                    ),
+                ]
+                .spacing(8),
+            );
+        }
+        DmxBackendKind::Sacn => {
+            content = content.push(
+                column![
+                    text_input("sACN Target", &state.settings.dmx.sacn_target)
+                        .on_input(AppEvent::SetSacnTarget)
+                        .padding([8, 10]),
+                    text(format!(
+                        "sACN Universe: {}",
+                        state.settings.dmx.sacn_universe
+                    ))
+                    .size(12)
+                    .color(theme::text_muted()),
+                    slider(
+                        1..=64,
+                        state.settings.dmx.sacn_universe,
+                        AppEvent::SetSacnUniverse
+                    ),
+                ]
+                .spacing(8),
+            );
+        }
+        DmxBackendKind::Disabled => {}
+    }
+
+    if let Some(error) = &state.settings.dmx.last_error {
+        content = content.push(
+            container(text(error).size(12).color(theme::warning()))
+                .padding([8, 10])
+                .style(|_| theme::panel_inner()),
+        );
+    }
+
+    content
+        .push(output_runtime_card(state))
+        .push(dmx_output_monitor_panel(state))
+        .into()
+}
+
+fn midi_settings_panel(state: &StudioState) -> Element<'_, AppEvent> {
+    let input_choices = midi_port_choices(&state.settings.midi.inputs, "No MIDI Input");
+    let output_choices = midi_port_choices(&state.settings.midi.outputs, "No MIDI Output");
+    let selected_input = selected_port_choice(
+        &input_choices,
+        state.settings.midi.selected_input.as_deref(),
+    );
+    let selected_output = selected_port_choice(
+        &output_choices,
+        state.settings.midi.selected_output.as_deref(),
+    );
+
+    let learn_active = state.settings.midi.learn.phase != MidiLearnPhase::Idle;
+    let automap_button = {
+        let button =
+            button(text("Apply Automap"))
+                .padding([8, 12])
+                .style(move |_: &Theme, status| {
+                    theme::toggle_button(
+                        status,
+                        state.can_apply_controller_automap(),
+                        theme::accent_blue(),
+                    )
+                });
+        if state.can_apply_controller_automap() {
+            button.on_press(AppEvent::ApplyDetectedControllerAutomap)
+        } else {
+            button
+        }
+    };
+
+    let clear_button = {
+        let button =
+            button(text("Clear Bindings"))
+                .padding([8, 12])
+                .style(move |_: &Theme, status| {
+                    theme::toggle_button(
+                        status,
+                        !state.settings.midi.bindings.is_empty(),
+                        theme::warning(),
+                    )
+                });
+        if state.settings.midi.bindings.is_empty() {
+            button
+        } else {
+            button.on_press(AppEvent::ClearMidiBindings)
+        }
+    };
+
+    let cancel_button = {
+        let button =
+            button(text("Cancel Learn"))
+                .padding([8, 12])
+                .style(move |_: &Theme, status| {
+                    theme::toggle_button(status, learn_active, theme::warning())
+                });
+        if learn_active {
+            button.on_press(AppEvent::CancelMidiLearn)
+        } else {
+            button
+        }
+    };
+
+    let summary = container(
+        column![
+            text(format!(
+                "Learn: {}",
+                midi_learn_phase_label(state.settings.midi.learn.phase)
+            ))
+            .size(12)
+            .color(theme::text_muted()),
+            text(
+                state
+                    .settings
+                    .midi
+                    .learn
+                    .target_binding
+                    .and_then(|binding_id| state.midi_binding(binding_id))
+                    .map(|binding| format!("Target: {}", binding.label))
+                    .unwrap_or_else(|| "Target: none".to_owned())
+            )
+            .size(12)
+            .color(theme::text_primary()),
+            text(
+                state
+                    .settings
+                    .midi
+                    .last_message
+                    .as_ref()
+                    .map(midi_runtime_message_summary)
+                    .unwrap_or_else(|| "Last MIDI: none".to_owned())
+            )
+            .size(11)
+            .color(theme::text_muted()),
+        ]
+        .spacing(6),
+    )
+    .padding([8, 10])
+    .style(|_| theme::panel_inner());
+
+    let mut bindings_column = column![].spacing(8);
+    for binding in &state.settings.midi.bindings {
+        bindings_column = bindings_column.push(midi_binding_row(state, binding));
+    }
+    if state.settings.midi.bindings.is_empty() {
+        bindings_column = bindings_column.push(
+            container(text("Noch keine MIDI-Bindings vorhanden."))
+                .padding([8, 10])
+                .style(|_| theme::panel_inner()),
+        );
+    }
+
+    let mut content = column![
+        column![
+            text("MIDI Input").size(12).color(theme::text_muted()),
+            pick_list(input_choices, selected_input, |choice| {
+                AppEvent::SelectMidiInput(choice.id)
+            })
+            .placeholder("MIDI Input wählen"),
+        ]
+        .spacing(6),
+        column![
+            text("MIDI Output").size(12).color(theme::text_muted()),
+            pick_list(output_choices, selected_output, |choice| {
+                AppEvent::SelectMidiOutput(choice.id)
+            })
+            .placeholder("MIDI Output wählen"),
+        ]
+        .spacing(6),
+        settings_toggle_button(
+            "MIDI Feedback",
+            state.settings.midi.feedback_enabled,
+            AppEvent::SetMidiFeedbackEnabled(!state.settings.midi.feedback_enabled),
+            theme::success(),
+        ),
+        row![automap_button, clear_button, cancel_button]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        summary,
+        bindings_column,
+    ]
+    .spacing(10);
+
+    if let Some(error) = &state.settings.midi.last_error {
+        content = content.push(
+            container(text(error).size(12).color(theme::warning()))
+                .padding([8, 10])
+                .style(|_| theme::panel_inner()),
+        );
+    }
+
+    content
+        .push(output_runtime_card(state))
+        .push(midi_feedback_monitor_panel(state))
+        .into()
+}
+
+fn controller_settings_panel(state: &StudioState) -> Element<'_, AppEvent> {
+    let detected = state
+        .selected_controller_profile()
+        .map(controller_profile_label)
+        .unwrap_or("None");
+    let remaining = state.settings.midi.learn.capture_queue.len();
+
+    let profiles = [
+        (
+            ControllerProfileKind::Apc40Mk2,
+            "Akai APC40 mkII",
+            "5x8 Grid, Device-Knobs, Fader, Transport",
+        ),
+        (
+            ControllerProfileKind::DenonPrime2,
+            "Denon Prime 2",
+            "2 Decks, Sweep FX, Filter, 16 Performance Pads, Pad Modes",
+        ),
+        (
+            ControllerProfileKind::BehringerCmdDc1,
+            "Behringer CMD DC-1",
+            "16 Pads, 8 Encoder, FX-Buttons, Jog/Zoom",
+        ),
+        (
+            ControllerProfileKind::BehringerCmdLc1,
+            "Behringer CMD LC-1",
+            "4x8 Grid, 8 Encoder, Transport, Master Macro",
+        ),
+    ];
+
+    let mut content = column![
+        container(
+            column![
+                text(format!("Detected: {}", detected))
+                    .size(12)
+                    .color(theme::text_primary()),
+                text(format!("Automap Queue: {} remaining", remaining))
+                    .size(11)
+                    .color(theme::text_muted()),
+            ]
+            .spacing(6),
+        )
+        .padding([8, 10])
+        .style(|_| theme::panel_inner()),
+    ]
+    .spacing(10);
+
+    for (profile, title, summary) in profiles {
+        let is_detected = state.selected_controller_profile() == Some(profile);
+        content = content.push(
+            container(
+                column![
+                    text(title).size(13).color(theme::text_primary()),
+                    text(summary).size(11).color(theme::text_muted()),
+                    text(format!(
+                        "Automap: {}",
+                        controller_profile_mapping_summary(profile)
+                    ))
+                    .size(11)
+                    .color(theme::text_muted()),
+                ]
+                .spacing(6),
+            )
+            .padding([8, 10])
+            .style(move |_| {
+                theme::track_card(
+                    if is_detected {
+                        theme::accent_blue()
+                    } else {
+                        theme::muted_chip()
+                    },
+                    is_detected,
+                )
+            }),
+        );
+    }
+
+    content.into()
+}
+
+fn engine_settings_panel(state: &StudioState) -> Element<'_, AppEvent> {
+    let mode_choices = engine_link_mode_choices();
+    let selected_mode = mode_choices
+        .iter()
+        .find(|choice| choice.value == state.settings.engine_link.mode)
+        .copied();
+    let follow_choices = engine_follow_choices();
+    let selected_follow = follow_choices
+        .iter()
+        .find(|choice| choice.value == state.settings.engine_link.follow_mode)
+        .copied();
+    let device_choices = engine_device_choices(state);
+    let selected_device = selected_engine_device_choice(
+        &device_choices,
+        state.settings.engine_link.selected_device.as_deref(),
+    );
+
+    let refresh_button = {
+        let button =
+            button(text("Refresh Engine Link"))
+                .padding([8, 12])
+                .style(move |_: &Theme, status| {
+                    theme::toggle_button(
+                        status,
+                        state.can_refresh_engine_link_discovery(),
+                        theme::accent_playhead(),
+                    )
+                });
+        if state.can_refresh_engine_link_discovery() {
+            button.on_press(AppEvent::RefreshEngineLinkDiscovery)
+        } else {
+            button
+        }
+    };
+
+    let summary = container(
+        column![
+            text(format!(
+                "Phase: {:?}  |  Discovery UDP {}",
+                state.settings.engine_link.phase, state.settings.engine_link.discovery_port
+            ))
+            .size(12)
+            .color(theme::text_primary()),
+            text(
+                state
+                    .settings
+                    .engine_link
+                    .last_summary
+                    .clone()
+                    .unwrap_or_else(|| {
+                        "Prime-/Engine-Discovery ist bereit. Erwartet Stagelinq-Announcements."
+                            .to_owned()
+                    })
+            )
+            .size(11)
+            .color(theme::text_muted()),
+            text(
+                state
+                    .settings
+                    .engine_link
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "Kein Engine-Link-Fehler.".to_owned())
+            )
+            .size(11)
+            .color(theme::warning()),
+        ]
+        .spacing(6),
+    )
+    .padding([8, 10])
+    .style(|_| theme::panel_inner());
+
+    let device_list: Element<'_, AppEvent> = if state.settings.engine_link.devices.is_empty() {
+        container(text("Noch keine Prime-/Engine-Devices entdeckt."))
+            .padding([8, 10])
+            .style(|_| theme::panel_inner())
+            .into()
+    } else {
+        column(
+            state
+                .settings
+                .engine_link
+                .devices
+                .iter()
+                .map(|device| engine_device_card(device, state))
+                .collect::<Vec<_>>(),
+        )
+        .spacing(8)
+        .into()
+    };
+
+    let telemetry_panel: Element<'_, AppEvent> =
+        if let Some(telemetry) = state.settings.engine_link.telemetry.as_ref() {
+            let mut content = column![
+                container(
+                    column![
+                        text(format!("Telemetry Device: {}", telemetry.device_id))
+                            .size(12)
+                            .color(theme::text_primary()),
+                        text(telemetry.summary.clone())
+                            .size(11)
+                            .color(theme::text_muted()),
+                    ]
+                    .spacing(4),
+                )
+                .padding([8, 10])
+                .style(|_| theme::panel_inner()),
+            ]
+            .spacing(8);
+
+            for deck in &telemetry.decks {
+                content = content.push(engine_deck_card(deck));
+            }
+
+            content = content.push(
+                container(
+                    text(format!(
+                        "Mixer: Crossfader {}  |  Channel Faders {}",
+                        telemetry.mixer.crossfader.permille(),
+                        telemetry
+                            .mixer
+                            .channel_faders
+                            .iter()
+                            .map(|value| value.permille().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                    .size(11)
+                    .color(theme::text_muted()),
+                )
+                .padding([8, 10])
+                .style(|_| theme::panel_inner()),
+            );
+
+            content.into()
+        } else {
+            container(
+                text(
+                    "Noch keine Session-Telemetrie. Discovery und Device-Auswahl sind aktiv; "
+                        .to_owned()
+                        + "der Runtime-Pfad wartet auf typisierte StageLinq-Service-Daten.",
+                )
+                .size(11)
+                .color(theme::text_muted()),
+            )
+            .padding([8, 10])
+            .style(|_| theme::panel_inner())
+            .into()
+        };
+
+    column![
+        row![
+            settings_toggle_button(
+                "Enabled",
+                state.settings.engine_link.enabled,
+                AppEvent::SetEngineLinkEnabled(!state.settings.engine_link.enabled),
+                theme::accent_blue(),
+            ),
+            settings_toggle_button(
+                "Auto Connect",
+                state.settings.engine_link.auto_connect,
+                AppEvent::SetEngineLinkAutoConnect(!state.settings.engine_link.auto_connect),
+                theme::success(),
+            ),
+            settings_toggle_button(
+                "Adopt Transport",
+                state.settings.engine_link.adopt_transport,
+                AppEvent::SetEngineLinkAdoptTransport(!state.settings.engine_link.adopt_transport),
+                theme::accent_playhead(),
+            ),
+            refresh_button,
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+        row![
+            pick_list(mode_choices, selected_mode, |choice| {
+                AppEvent::SetEngineLinkMode(choice.value)
+            })
+            .placeholder("Link Mode")
+            .width(Length::FillPortion(2)),
+            pick_list(follow_choices, selected_follow, |choice| {
+                AppEvent::SetEngineLinkFollowMode(choice.value)
+            })
+            .placeholder("Follow")
+            .width(Length::FillPortion(2)),
+            pick_list(device_choices, selected_device, |choice| {
+                AppEvent::SelectEngineLinkDevice(choice.id.clone())
+            })
+            .placeholder("Prime Device")
+            .width(Length::FillPortion(3)),
+        ]
+        .spacing(8),
+        summary,
+        device_list,
+        telemetry_panel,
+    ]
+    .spacing(10)
+    .into()
+}
+
+fn engine_device_card<'a>(
+    device: &'a EnginePrimeDevice,
+    state: &'a StudioState,
+) -> Element<'a, AppEvent> {
+    let is_selected = state.settings.engine_link.selected_device.as_deref() == Some(&device.id);
+    let services = if device.services.is_empty() {
+        "Services: announce only".to_owned()
+    } else {
+        format!(
+            "Services: {}",
+            device
+                .services
+                .iter()
+                .map(|service| format!("{}:{}", service.name, service.port))
+                .collect::<Vec<_>>()
+                .join("  |  ")
+        )
+    };
+
+    container(
+        column![
+            text(format!("{}  |  {}", device.name, device.address))
+                .size(12)
+                .color(theme::text_primary()),
+            text(format!(
+                "{} {}  |  Service {:?}",
+                device.software_name, device.software_version, device.service_port
+            ))
+            .size(11)
+            .color(theme::text_muted()),
+            text(services).size(11).color(theme::text_muted()),
+        ]
+        .spacing(4),
+    )
+    .padding([8, 10])
+    .style(move |_| {
+        theme::track_card(
+            if is_selected {
+                theme::accent_playhead()
+            } else {
+                theme::muted_chip()
+            },
+            is_selected,
+        )
+    })
+    .into()
+}
+
+fn engine_deck_card(deck: &crate::core::EngineDeckTelemetry) -> Element<'_, AppEvent> {
+    let accent = match deck.phase {
+        EngineDeckPhase::Playing | EngineDeckPhase::Syncing => theme::success(),
+        EngineDeckPhase::Paused | EngineDeckPhase::Cueing => theme::warning(),
+        EngineDeckPhase::Idle => theme::muted_chip(),
+    };
+
+    container(
+        column![
+            text(format!(
+                "Deck {}  |  {}  |  {:.2} BPM",
+                deck.deck_index,
+                deck.track_name,
+                deck.bpm.as_f32()
+            ))
+            .size(12)
+            .color(theme::text_primary()),
+            text(format!(
+                "Artist: {}  |  Beat {:.2}  |  {:?}",
+                deck.artist_name,
+                deck.beat.as_beats_f32(),
+                deck.phase
+            ))
+            .size(11)
+            .color(theme::text_muted()),
+            text(format!(
+                "Master: {}  |  Sync: {}",
+                if deck.is_master { "Yes" } else { "No" },
+                if deck.is_synced { "On" } else { "Off" }
+            ))
+            .size(11)
+            .color(theme::text_muted()),
+        ]
+        .spacing(4),
+    )
+    .padding([8, 10])
+    .style(move |_| theme::track_card(accent, matches!(deck.phase, EngineDeckPhase::Playing)))
+    .into()
+}
+
+fn settings_toggle_button<'a>(
+    label: &'a str,
+    active: bool,
+    event: AppEvent,
+    accent: iced::Color,
+) -> Element<'a, AppEvent> {
+    button(text(format!(
+        "{}  |  {}",
+        label,
+        if active { "On" } else { "Off" }
+    )))
+    .padding([8, 12])
+    .style(move |_: &Theme, status| theme::toggle_button(status, active, accent))
+    .on_press(event)
     .into()
 }
 
@@ -1882,7 +3296,665 @@ fn fx_row(layer: &FxLayer, is_selected: bool) -> Element<'_, AppEvent> {
     .into()
 }
 
-fn fixture_row(group: &FixtureGroup, is_selected: bool) -> Element<'_, AppEvent> {
+fn fixture_management_panel(state: &StudioState) -> Element<'_, AppEvent> {
+    let import_ofl_button = {
+        let button = button(text("Fetch OFL"))
+            .padding([6, 10])
+            .style(move |_: &Theme, status| {
+                theme::toggle_button(
+                    status,
+                    state.can_import_fixture_from_ofl(),
+                    theme::accent_blue(),
+                )
+            });
+        if state.can_import_fixture_from_ofl() {
+            button.on_press(AppEvent::RequestImportFixtureFromOfl)
+        } else {
+            button
+        }
+    };
+
+    let import_qxf_button = {
+        let button = button(text("Import QXF"))
+            .padding([6, 10])
+            .style(move |_: &Theme, status| {
+                theme::toggle_button(
+                    status,
+                    state.can_import_fixture_from_qxf(),
+                    theme::accent_playhead(),
+                )
+            });
+        if state.can_import_fixture_from_qxf() {
+            button.on_press(AppEvent::RequestImportFixtureFromQxfPath)
+        } else {
+            button
+        }
+    };
+
+    let export_qxf_button = {
+        let button = button(text("Export QXF"))
+            .padding([6, 10])
+            .style(move |_: &Theme, status| {
+                theme::toggle_button(
+                    status,
+                    state.can_export_selected_fixture_profile(),
+                    theme::success(),
+                )
+            });
+        if state.can_export_selected_fixture_profile() {
+            button.on_press(AppEvent::RequestExportSelectedFixtureAsQxf)
+        } else {
+            button
+        }
+    };
+
+    let delete_profile_button = {
+        let button =
+            button(text("Delete Profile"))
+                .padding([6, 10])
+                .style(move |_: &Theme, status| {
+                    theme::toggle_button(
+                        status,
+                        state.can_delete_selected_fixture_profile(),
+                        theme::warning(),
+                    )
+                });
+        if state.can_delete_selected_fixture_profile() {
+            button.on_press(AppEvent::DeleteSelectedFixtureProfile)
+        } else {
+            button
+        }
+    };
+
+    let add_patch_button = {
+        let button = button(text("Add Patch"))
+            .padding([6, 10])
+            .style(move |_: &Theme, status| {
+                theme::toggle_button(
+                    status,
+                    state.can_create_fixture_patch(),
+                    theme::accent_blue(),
+                )
+            });
+        if state.can_create_fixture_patch() {
+            button.on_press(AppEvent::CreateFixturePatch)
+        } else {
+            button
+        }
+    };
+
+    let delete_patch_button = {
+        let button =
+            button(text("Delete Patch"))
+                .padding([6, 10])
+                .style(move |_: &Theme, status| {
+                    theme::toggle_button(
+                        status,
+                        state.can_delete_selected_fixture_patch(),
+                        theme::warning(),
+                    )
+                });
+        if state.can_delete_selected_fixture_patch() {
+            button.on_press(AppEvent::DeleteSelectedFixturePatch)
+        } else {
+            button
+        }
+    };
+
+    let status_text = state
+        .fixture_system
+        .library
+        .last_error
+        .clone()
+        .or_else(|| state.fixture_system.library.last_summary.clone())
+        .unwrap_or_else(|| "Fixture-Library bereit".to_owned());
+
+    let mut profiles = column![text("Profiles").size(12).color(theme::text_muted())].spacing(8);
+    if state.fixture_system.library.profiles.is_empty() {
+        profiles = profiles.push(
+            container(text("Noch keine Fixture-Profile importiert."))
+                .padding([8, 10])
+                .style(|_| theme::panel_subtle()),
+        );
+    } else {
+        for profile in &state.fixture_system.library.profiles {
+            profiles = profiles.push(fixture_profile_row(
+                profile,
+                state.fixture_system.library.selected_profile.as_deref()
+                    == Some(profile.id.as_str()),
+            ));
+        }
+    }
+
+    let mut patches = column![text("Patches").size(12).color(theme::text_muted())].spacing(8);
+    if state.fixture_system.library.patches.is_empty() {
+        patches = patches.push(
+            container(text("Noch keine Fixtures gepatcht."))
+                .padding([8, 10])
+                .style(|_| theme::panel_subtle()),
+        );
+    } else {
+        for patch in &state.fixture_system.library.patches {
+            patches = patches.push(fixture_patch_row(
+                patch,
+                state,
+                state.fixture_system.library.selected_patch == Some(patch.id),
+            ));
+        }
+    }
+
+    container(
+        column![
+            text("Fixture Library").size(13).color(theme::text_muted()),
+            row![
+                text_input(
+                    "ofl manufacturer key",
+                    &state.fixture_system.library.ofl_manufacturer_key
+                )
+                .on_input(AppEvent::SetFixtureOflManufacturerKey)
+                .padding([8, 10])
+                .width(Length::FillPortion(1)),
+                text_input(
+                    "ofl fixture key",
+                    &state.fixture_system.library.ofl_fixture_key
+                )
+                .on_input(AppEvent::SetFixtureOflFixtureKey)
+                .padding([8, 10])
+                .width(Length::FillPortion(1)),
+            ]
+            .spacing(8),
+            row![
+                text_input(
+                    "import .qxf path",
+                    &state.fixture_system.library.qxf_import_path
+                )
+                .on_input(AppEvent::SetFixtureQxfImportPath)
+                .padding([8, 10])
+                .width(Length::FillPortion(2)),
+                import_ofl_button,
+                import_qxf_button,
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            row![
+                text_input(
+                    "export .qxf path",
+                    &state.fixture_system.library.qxf_export_path
+                )
+                .on_input(AppEvent::SetFixtureQxfExportPath)
+                .padding([8, 10])
+                .width(Length::FillPortion(2)),
+                export_qxf_button,
+                delete_profile_button,
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            container(text(status_text).size(12).color(
+                if state.fixture_system.library.last_error.is_some() {
+                    theme::warning()
+                } else {
+                    theme::text_primary()
+                }
+            ),)
+            .padding([8, 10])
+            .style(|_| theme::panel_subtle()),
+            selected_fixture_profile_card(state),
+            row![add_patch_button, delete_patch_button]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            selected_fixture_patch_card(state),
+            selected_fixture_group_patch_card(state),
+            fixture_universe_summary_panel(state),
+            profiles,
+            patches,
+        ]
+        .spacing(10),
+    )
+    .padding([10, 12])
+    .style(|_| theme::panel_inner())
+    .into()
+}
+
+fn selected_fixture_profile_card(state: &StudioState) -> Element<'_, AppEvent> {
+    let Some(profile) = state.selected_fixture_profile() else {
+        return container(text("Kein Fixture-Profil selektiert."))
+            .padding([8, 10])
+            .style(|_| theme::panel_subtle())
+            .into();
+    };
+
+    let source_label = match profile.source.kind {
+        crate::core::FixtureSourceKind::Demo => "demo",
+        crate::core::FixtureSourceKind::OpenFixtureLibrary => "ofl",
+        crate::core::FixtureSourceKind::Qxf => "qxf",
+    };
+    let dimensions = profile
+        .physical
+        .as_ref()
+        .and_then(|physical| physical.dimensions_mm)
+        .map(|[x, y, z]| format!("{x}x{y}x{z} mm"))
+        .unwrap_or_else(|| "n/a".to_owned());
+
+    container(
+        column![
+            text("Selected Profile").size(12).color(theme::text_muted()),
+            text(format!("{} {}", profile.manufacturer, profile.model))
+                .size(15)
+                .color(theme::text_primary()),
+            text(format!(
+                "{}  |  {} mode(s)  |  {} channel(s)",
+                source_label,
+                profile.modes.len(),
+                profile.channels.len()
+            ))
+            .size(12)
+            .color(theme::text_muted()),
+            text(format!(
+                "Categories: {}  |  Physical: {}",
+                profile.categories.join(", "),
+                dimensions
+            ))
+            .size(12)
+            .color(theme::text_primary()),
+        ]
+        .spacing(6),
+    )
+    .padding([10, 12])
+    .style(|_| theme::panel_subtle())
+    .into()
+}
+
+fn selected_fixture_patch_card(state: &StudioState) -> Element<'_, AppEvent> {
+    let Some(patch) = state.selected_fixture_patch() else {
+        return container(text("Kein Fixture-Patch selektiert."))
+            .padding([8, 10])
+            .style(|_| theme::panel_subtle())
+            .into();
+    };
+
+    let mode_options = state
+        .fixture_profile(&patch.profile_id)
+        .map(|profile| {
+            profile
+                .modes
+                .iter()
+                .map(|mode| mode.name.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let group_options = fixture_group_choices(state);
+    let footprint = state.fixture_patch_channel_count(patch).unwrap_or(0);
+    let end_address = state
+        .fixture_patch_end_address(patch)
+        .unwrap_or(patch.address);
+    let conflicts = state.fixture_patch_conflicts(patch.id);
+    let group_label = patch
+        .group_id
+        .and_then(|group_id| state.fixture_group(group_id))
+        .map(|group| group.name.clone())
+        .unwrap_or_else(|| "No Preview Group".to_owned());
+
+    container(
+        column![
+            text("Selected Patch").size(12).color(theme::text_muted()),
+            text_input("Patch Name", &patch.name)
+                .on_input(AppEvent::SetSelectedFixturePatchName)
+                .padding([8, 10]),
+            row![
+                column![
+                    text("Mode").size(12).color(theme::text_muted()),
+                    pick_list(
+                        mode_options,
+                        Some(patch.mode_name.clone()),
+                        AppEvent::SetSelectedFixturePatchMode
+                    )
+                    .placeholder("Mode"),
+                ]
+                .spacing(6)
+                .width(Length::FillPortion(2)),
+                column![
+                    text("Group").size(12).color(theme::text_muted()),
+                    pick_list(
+                        group_options.clone(),
+                        selected_fixture_group_choice(&group_options, patch.group_id),
+                        |choice| AppEvent::SetSelectedFixturePatchGroup(choice.id)
+                    )
+                    .placeholder("Preview Group"),
+                ]
+                .spacing(6)
+                .width(Length::FillPortion(2)),
+            ]
+            .spacing(10),
+            row![
+                column![
+                    text("Universe").size(12).color(theme::text_muted()),
+                    slider(1.0..=64.0, patch.universe as f32, |value| {
+                        AppEvent::SetSelectedFixturePatchUniverse(value.round() as u16)
+                    })
+                    .step(1.0),
+                    text(format!("U{}", patch.universe))
+                        .size(12)
+                        .color(theme::text_primary()),
+                ]
+                .spacing(6)
+                .width(Length::FillPortion(1)),
+                column![
+                    text("Address").size(12).color(theme::text_muted()),
+                    slider(1.0..=512.0, patch.address as f32, |value| {
+                        AppEvent::SetSelectedFixturePatchAddress(value.round() as u16)
+                    })
+                    .step(1.0),
+                    text(format!("{:03}", patch.address))
+                        .size(12)
+                        .color(theme::text_primary()),
+                ]
+                .spacing(6)
+                .width(Length::FillPortion(1)),
+            ]
+            .spacing(10),
+            text(format!(
+                "Span U{}.{}-{}  |  {}ch  |  Group {}",
+                patch.universe, patch.address, end_address, footprint, group_label
+            ))
+            .size(12)
+            .color(theme::text_primary()),
+            text(if conflicts.is_empty() {
+                "Universe layout clean".to_owned()
+            } else {
+                format!("Overlap with patch ids {:?}", conflicts)
+            })
+            .size(12)
+            .color(if conflicts.is_empty() {
+                theme::text_muted()
+            } else {
+                theme::warning()
+            }),
+        ]
+        .spacing(10),
+    )
+    .padding([10, 12])
+    .style(|_| theme::panel_subtle())
+    .into()
+}
+
+fn selected_fixture_group_patch_card(state: &StudioState) -> Element<'_, AppEvent> {
+    let Some(group) = state.selected_fixture_group() else {
+        return container(text("Keine Preview-Gruppe fuer Patch-Mapping selektiert."))
+            .padding([8, 10])
+            .style(|_| theme::panel_subtle())
+            .into();
+    };
+
+    let summary = state.fixture_group_patch_summary(group.id);
+    let mapped_names = state
+        .fixture_patches_for_group(group.id)
+        .into_iter()
+        .map(|patch| patch.name.clone())
+        .take(4)
+        .collect::<Vec<_>>();
+
+    container(
+        column![
+            text("Selected Group Patch Map")
+                .size(12)
+                .color(theme::text_muted()),
+            text(format!(
+                "{}  |  {} mapped patch(es)  |  {} enabled",
+                group.name, summary.patch_count, summary.enabled_patch_count
+            ))
+            .size(15)
+            .color(theme::text_primary()),
+            text(format!(
+                "{}  |  {} occupied DMX ch  |  {} footprint ch",
+                format_universe_labels(&summary.universes),
+                summary.occupied_channels,
+                summary.footprint_channels
+            ))
+            .size(12)
+            .color(theme::text_primary()),
+            text(if summary.conflicting_patch_ids.is_empty() {
+                "No patch overlaps in this preview group".to_owned()
+            } else {
+                format!("Overlap patch ids {:?}", summary.conflicting_patch_ids)
+            })
+            .size(12)
+            .color(if summary.conflicting_patch_ids.is_empty() {
+                theme::text_muted()
+            } else {
+                theme::warning()
+            }),
+            text(if mapped_names.is_empty() {
+                "Noch keine gepatchten Fixtures in dieser Gruppe.".to_owned()
+            } else {
+                format!("Mapped: {}", mapped_names.join(", "))
+            })
+            .size(12)
+            .color(theme::text_muted()),
+        ]
+        .spacing(6),
+    )
+    .padding([10, 12])
+    .style(|_| theme::panel_subtle())
+    .into()
+}
+
+fn fixture_universe_summary_panel(state: &StudioState) -> Element<'_, AppEvent> {
+    let summaries = state.fixture_universe_summaries();
+    if summaries.is_empty() {
+        return container(text("Keine belegten DMX-Universes."))
+            .padding([8, 10])
+            .style(|_| theme::panel_subtle())
+            .into();
+    }
+
+    let monitor = build_output_monitor_snapshot(state);
+    let mut content = column![
+        text("DMX Universe Routing")
+            .size(12)
+            .color(theme::text_muted())
+    ]
+    .spacing(8);
+    for summary in summaries {
+        let monitor_entry = monitor
+            .universe_monitors
+            .iter()
+            .find(|entry| entry.internal_universe == summary.universe);
+        let destination = monitor_entry
+            .map(|entry| entry.destination.clone())
+            .unwrap_or_else(|| "Preview only".to_owned());
+        let active_slots = monitor_entry.map(|entry| entry.active_slots).unwrap_or(0);
+        let peak_value = monitor_entry.map(|entry| entry.peak_value).unwrap_or(0);
+        let segment_levels = monitor_entry
+            .map(|entry| entry.segment_levels.clone())
+            .unwrap_or_else(|| vec![0; 16]);
+        let patch_labels = monitor_entry
+            .map(|entry| entry.patch_labels.clone())
+            .unwrap_or_default();
+
+        content = content.push(
+            container(
+                column![
+                    row![
+                        text(format!("U{}", summary.universe))
+                            .size(14)
+                            .color(theme::text_primary()),
+                        text(format!(
+                            "{} patch(es)  |  {} enabled",
+                            summary.patch_count, summary.enabled_patch_count
+                        ))
+                        .size(12)
+                        .color(theme::text_muted()),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                    text(format!(
+                        "{} occupied ch  |  {} footprint ch  |  max {}",
+                        summary.occupied_channels,
+                        summary.footprint_channels,
+                        summary.highest_address
+                    ))
+                    .size(12)
+                    .color(theme::text_primary()),
+                    text(format!(
+                        "Route: {}  |  {} active slot(s)  |  peak {}",
+                        destination, active_slots, peak_value
+                    ))
+                    .size(12)
+                    .color(theme::text_muted()),
+                    output_segment_strip(segment_levels),
+                    text(if summary.conflicting_patch_ids.is_empty() {
+                        "Universe layout clean".to_owned()
+                    } else {
+                        format!("Overlap patch ids {:?}", summary.conflicting_patch_ids)
+                    })
+                    .size(12)
+                    .color(if summary.conflicting_patch_ids.is_empty() {
+                        theme::text_muted()
+                    } else {
+                        theme::warning()
+                    }),
+                    text(if patch_labels.is_empty() {
+                        "Keine aktiven Patch-Namen fuer dieses Universe.".to_owned()
+                    } else {
+                        format!("Patches: {}", patch_labels.join(", "))
+                    })
+                    .size(11)
+                    .color(theme::text_muted()),
+                ]
+                .spacing(6),
+            )
+            .padding([8, 10])
+            .style(|_| theme::panel_subtle()),
+        );
+    }
+
+    content.into()
+}
+
+fn fixture_profile_row(
+    profile: &crate::core::FixtureProfile,
+    is_selected: bool,
+) -> Element<'_, AppEvent> {
+    let accent = if is_selected {
+        theme::accent_blue()
+    } else {
+        theme::muted_chip()
+    };
+
+    container(
+        column![
+            row![
+                container(text(""))
+                    .width(Length::Fixed(8.0))
+                    .style(move |_| theme::color_bar(accent)),
+                text(format!("{} {}", profile.manufacturer, profile.model))
+                    .size(14)
+                    .color(theme::text_primary()),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+            row![
+                button(text("Select"))
+                    .padding([6, 10])
+                    .style(move |_: &Theme, button_state| {
+                        theme::toggle_button(button_state, is_selected, theme::accent_blue())
+                    })
+                    .on_press(AppEvent::SelectFixtureProfile(profile.id.clone())),
+                text(format!(
+                    "{} mode(s)  |  {} channel(s)",
+                    profile.modes.len(),
+                    profile.channels.len()
+                ))
+                .size(12)
+                .color(theme::text_muted()),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(8),
+    )
+    .padding([10, 12])
+    .style(move |_| theme::track_card(accent, is_selected))
+    .into()
+}
+
+fn fixture_patch_row<'a>(
+    patch: &'a FixturePatch,
+    state: &'a StudioState,
+    is_selected: bool,
+) -> Element<'a, AppEvent> {
+    let accent = if patch.enabled {
+        theme::success()
+    } else {
+        theme::warning()
+    };
+    let profile_label = state
+        .fixture_profile(&patch.profile_id)
+        .map(|profile| format!("{} {}", profile.manufacturer, profile.model))
+        .unwrap_or_else(|| patch.profile_id.clone());
+    let footprint = state.fixture_patch_channel_count(patch).unwrap_or(0);
+    let end_address = state
+        .fixture_patch_end_address(patch)
+        .unwrap_or(patch.address);
+    let conflicts = state.fixture_patch_conflicts(patch.id);
+    let group_label = patch
+        .group_id
+        .and_then(|group_id| state.fixture_group(group_id))
+        .map(|group| group.name.clone())
+        .unwrap_or_else(|| "No group".to_owned());
+
+    container(
+        column![
+            row![
+                container(text(""))
+                    .width(Length::Fixed(8.0))
+                    .style(move |_| theme::color_bar(accent)),
+                text(&patch.name).size(14).color(theme::text_primary()),
+                text(format!("U{}.{}", patch.universe, patch.address))
+                    .size(12)
+                    .color(theme::text_muted()),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+            row![
+                button(text("Select"))
+                    .padding([6, 10])
+                    .style(move |_: &Theme, button_state| {
+                        theme::toggle_button(button_state, is_selected, theme::accent_blue())
+                    })
+                    .on_press(AppEvent::SelectFixturePatch(patch.id)),
+                text(format!(
+                    "{}  |  {}  |  {}  |  {}ch  |  {}-{}{}",
+                    profile_label,
+                    patch.mode_name,
+                    group_label,
+                    footprint,
+                    patch.address,
+                    end_address,
+                    if conflicts.is_empty() { "" } else { " overlap" }
+                ))
+                .size(12)
+                .color(if conflicts.is_empty() {
+                    theme::text_muted()
+                } else {
+                    theme::warning()
+                }),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(8),
+    )
+    .padding([10, 12])
+    .style(move |_| theme::track_card(accent, is_selected))
+    .into()
+}
+
+fn fixture_row<'a>(
+    group: &'a FixtureGroup,
+    state: &'a StudioState,
+    is_selected: bool,
+) -> Element<'a, AppEvent> {
     let accent = group.accent.to_iced();
     let status = match group.phase {
         FixturePhase::Uninitialized => "uninitialized",
@@ -1890,6 +3962,7 @@ fn fixture_row(group: &FixtureGroup, is_selected: bool) -> Element<'_, AppEvent>
         FixturePhase::Active => "active",
         FixturePhase::Error => "error",
     };
+    let summary = state.fixture_group_patch_summary(group.id);
 
     container(
         column![
@@ -1915,6 +3988,16 @@ fn fixture_row(group: &FixtureGroup, is_selected: bool) -> Element<'_, AppEvent>
                 text(format!("Nodes {}", group.preview_nodes.len()))
                     .size(12)
                     .color(theme::text_muted()),
+                text(format!("Patches {}", summary.patch_count))
+                    .size(12)
+                    .color(theme::text_muted()),
+                text(format!("{}", format_universe_labels(&summary.universes)))
+                    .size(12)
+                    .color(if summary.conflicting_patch_ids.is_empty() {
+                        theme::text_muted()
+                    } else {
+                        theme::warning()
+                    }),
                 text(format!("Out {:>3}%", group.output_level / 10))
                     .size(12)
                     .color(theme::text_muted()),
@@ -1951,6 +4034,162 @@ fn perf_chip<'a>(label: &'a str, value: String) -> Element<'a, AppEvent> {
     .into()
 }
 
+fn dmx_interface_kind_label(kind: DmxInterfaceKind) -> &'static str {
+    match kind {
+        DmxInterfaceKind::EnttecOpenDmxCompatible => "ENTTEC Open DMX compatible",
+        DmxInterfaceKind::UsbSerial => "USB Serial",
+        DmxInterfaceKind::Unknown => "Unknown",
+    }
+}
+
+fn midi_action_label(action: MidiAction) -> String {
+    match action {
+        MidiAction::TransportToggle => "Transport".to_owned(),
+        MidiAction::MasterIntensity => "Master Intensity".to_owned(),
+        MidiAction::MasterSpeed => "Master Speed".to_owned(),
+        MidiAction::TimelineZoom => "Timeline Zoom".to_owned(),
+        MidiAction::TriggerCueSlot(slot) => format!("Cue Slot {}", slot),
+        MidiAction::TriggerChaseSlot(slot) => format!("Chase Slot {}", slot),
+        MidiAction::FocusFixtureGroupSlot(slot) => format!("Fixture Group {}", slot),
+        MidiAction::FxDepthSlot(slot) => format!("FX Depth {}", slot),
+    }
+}
+
+fn midi_message_kind_label(kind: MidiMessageKind) -> &'static str {
+    match kind {
+        MidiMessageKind::Note => "Note",
+        MidiMessageKind::ControlChange => "CC",
+        MidiMessageKind::PitchBend => "Pitch",
+    }
+}
+
+fn midi_binding_message_summary(message: &MidiBindingMessage) -> String {
+    format!(
+        "{} ch{} key{}",
+        midi_message_kind_label(message.kind),
+        message.channel,
+        message.key
+    )
+}
+
+fn midi_runtime_message_summary(message: &crate::core::MidiRuntimeMessage) -> String {
+    format!(
+        "Last MIDI: {} ch{} key{} val{}",
+        midi_message_kind_label(message.kind),
+        message.channel,
+        message.key,
+        message.value
+    )
+}
+
+fn midi_control_hint_label(hint: MidiControlHint) -> &'static str {
+    match hint {
+        MidiControlHint::Button => "Button",
+        MidiControlHint::Continuous => "Continuous",
+        MidiControlHint::Any => "Any",
+    }
+}
+
+fn midi_learn_phase_label(phase: MidiLearnPhase) -> &'static str {
+    match phase {
+        MidiLearnPhase::Idle => "Idle",
+        MidiLearnPhase::Listening => "Listening",
+        MidiLearnPhase::GuidedAutomap => "Guided Automap",
+    }
+}
+
+fn output_phase_label(phase: crate::core::OutputDeliveryPhase) -> &'static str {
+    match phase {
+        crate::core::OutputDeliveryPhase::Idle => "Idle",
+        crate::core::OutputDeliveryPhase::Dispatching => "Dispatching",
+        crate::core::OutputDeliveryPhase::Delivered => "Delivered",
+        crate::core::OutputDeliveryPhase::Error => "Error",
+    }
+}
+
+fn controller_profile_label(profile: ControllerProfileKind) -> &'static str {
+    match profile {
+        ControllerProfileKind::Apc40Mk2 => "APC40 mkII",
+        ControllerProfileKind::DenonPrime2 => "Denon Prime 2",
+        ControllerProfileKind::BehringerCmdDc1 => "CMD DC-1",
+        ControllerProfileKind::BehringerCmdLc1 => "CMD LC-1",
+    }
+}
+
+fn controller_profile_mapping_summary(profile: ControllerProfileKind) -> &'static str {
+    match profile {
+        ControllerProfileKind::Apc40Mk2 => {
+            "Master, Crossfader, 8 Device Knobs, Transport, 40 Cue Slots"
+        }
+        ControllerProfileKind::DenonPrime2 => {
+            "2 Sweep FX, 2 Filter, 2 FX Select, View Encoder, 16 Cue Pads, 8 Chase Pad Modes"
+        }
+        ControllerProfileKind::BehringerCmdDc1 => {
+            "Zoom, 8 Encoder, Transport, 16 Cue Pads, 8 Chase Buttons"
+        }
+        ControllerProfileKind::BehringerCmdLc1 => {
+            "8 Encoder, Transport, Master Macro, 32 Cue Grid Slots"
+        }
+    }
+}
+
+fn midi_binding_row<'a>(state: &'a StudioState, binding: &'a MidiBinding) -> Element<'a, AppEvent> {
+    let is_learning = state.settings.midi.learn.target_binding == Some(binding.id);
+    let mapping = binding
+        .message
+        .as_ref()
+        .map(midi_binding_message_summary)
+        .unwrap_or_else(|| "Pending learn".to_owned());
+    let subtitle = format!(
+        "{}  |  {}  |  {}",
+        midi_action_label(binding.action),
+        midi_control_hint_label(binding.hint),
+        if binding.learned {
+            "Learned"
+        } else {
+            "Template"
+        }
+    );
+
+    container(
+        row![
+            column![
+                text(&binding.label).size(13).color(theme::text_primary()),
+                text(subtitle).size(11).color(theme::text_muted()),
+                text(mapping).size(11).color(theme::text_muted()),
+            ]
+            .spacing(4)
+            .width(Length::Fill),
+            button(text(if is_learning { "Listening" } else { "Learn" }))
+                .padding([6, 10])
+                .style(move |_: &Theme, status| {
+                    theme::toggle_button(status, is_learning, theme::accent_blue())
+                })
+                .on_press(AppEvent::StartMidiLearn(binding.id)),
+            button(text("Clear"))
+                .padding([6, 10])
+                .style(|_: &Theme, status| {
+                    theme::toggle_button(status, binding.message.is_some(), theme::warning())
+                })
+                .on_press(AppEvent::RemoveMidiBinding(binding.id)),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    )
+    .padding([8, 10])
+    .style(move |_| {
+        theme::track_card(
+            if is_learning {
+                theme::accent_blue()
+            } else {
+                theme::muted_chip()
+            },
+            is_learning,
+        )
+    })
+    .into()
+}
+
 fn status_bar(state: &StudioState) -> Element<'_, AppEvent> {
     let status = row![
         text(state.selected_summary())
@@ -1968,8 +4207,23 @@ fn status_bar(state: &StudioState) -> Element<'_, AppEvent> {
     .spacing(10)
     .align_y(Alignment::Center);
 
-    container(status)
-        .padding([10, 14])
-        .style(|_| theme::status_bar())
-        .into()
+    let mut chips = row![].spacing(8).align_y(Alignment::Center);
+    if state.settings.show_fps_overlay {
+        chips = chips.push(perf_chip("FPS", state.performance.fps.to_string()));
+    }
+    if state.settings.show_cpu_overlay {
+        chips = chips.push(perf_chip(
+            "CPU",
+            format!("{}%", state.performance.cpu_load.0),
+        ));
+    }
+
+    container(
+        row![container(status).width(Length::Fill), chips]
+            .spacing(12)
+            .align_y(Alignment::Center),
+    )
+    .padding([10, 14])
+    .style(|_| theme::status_bar())
+    .into()
 }

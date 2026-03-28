@@ -1,8 +1,10 @@
 use crate::core::automation::{clamp_automation_value, sort_lane_points};
+use crate::core::fixtures::fixture_mode_channel_count;
 use crate::core::project::next_venture_name;
 use crate::core::state::{
-    ChasePhase, ClipEditorPhase, CuePhase, CueVisualState, EnginePhase, FixturePhase, HoverTarget,
-    MIN_CLIP_DURATION, SelectionState, SnapPhase, StateLifecycle, StudioState, TimelinePhase,
+    ChasePhase, ClipEditorPhase, CuePhase, CueVisualState, DmxBackendKind, DmxInterfaceKind,
+    EngineLinkPhase, EnginePhase, FixturePhase, HoverTarget, MIN_CLIP_DURATION, MidiControlHint,
+    MidiLearnPhase, SelectionState, SnapPhase, StateLifecycle, StudioState, TimelinePhase,
     TimelineViewport,
 };
 use serde::{Deserialize, Serialize};
@@ -37,6 +39,8 @@ pub fn validate_state(state: &StudioState) -> ValidationReport {
     validate_selection_and_hover(state, &mut issues);
     validate_timeline_bounds(state, &mut issues);
     validate_show_references(state, &mut issues);
+    validate_settings_hardware(state, &mut issues);
+    validate_engine_link(state, &mut issues);
     validate_authoring_extensions(state, &mut issues);
     validate_event_queue(state, &mut issues);
     validate_phase_consistency(state, &mut issues);
@@ -84,6 +88,14 @@ pub fn recover_state(state: &mut StudioState, report: &ValidationReport) -> Vali
                 state.fixture_system.selected = None;
                 corrections.push("fixture selection reset".to_owned());
             }
+            "fixture.profile.selected.missing" => {
+                state.fixture_system.library.selected_profile = None;
+                corrections.push("fixture profile selection reset".to_owned());
+            }
+            "fixture.patch.selected.missing" => {
+                state.fixture_system.library.selected_patch = None;
+                corrections.push("fixture patch selection reset".to_owned());
+            }
             "clip_editor.clip.missing" | "clip_editor.selection.mismatch" => {
                 state.clip_editor.phase = ClipEditorPhase::Closed;
                 state.clip_editor.clip_id = None;
@@ -124,6 +136,100 @@ pub fn recover_state(state: &mut StudioState, report: &ValidationReport) -> Vali
             "venture.recovery.selected.missing" => {
                 state.venture.selected_recovery = None;
                 corrections.push("recovery selection reset".to_owned());
+            }
+            "settings.dmx.interface.selected.missing" => {
+                state.settings.dmx.selected_interface = None;
+                corrections.push("dmx interface selection reset".to_owned());
+            }
+            "settings.midi.input.selected.missing" => {
+                state.settings.midi.selected_input = None;
+                state.settings.midi.detected_controller = None;
+                state.settings.midi.learn.phase = MidiLearnPhase::Idle;
+                state.settings.midi.learn.target_binding = None;
+                state.settings.midi.learn.capture_queue.clear();
+                state.settings.midi.learn.expected_hint = MidiControlHint::Any;
+                corrections.push("midi input selection reset".to_owned());
+            }
+            "settings.midi.output.selected.missing" => {
+                state.settings.midi.selected_output = None;
+                corrections.push("midi output selection reset".to_owned());
+            }
+            "settings.engine.device.selected.missing" => {
+                state.settings.engine_link.selected_device = None;
+                state.settings.engine_link.telemetry = None;
+                state.settings.engine_link.phase = if state.settings.engine_link.enabled {
+                    EngineLinkPhase::Idle
+                } else {
+                    EngineLinkPhase::Disabled
+                };
+                corrections.push("engine-link selection reset".to_owned());
+            }
+            "settings.engine.discovery_port.out_of_bounds" => {
+                state.settings.engine_link.discovery_port = state
+                    .settings
+                    .engine_link
+                    .discovery_port
+                    .clamp(1_024, 65_535);
+                corrections.push("engine-link discovery port clamped".to_owned());
+            }
+            "settings.engine.telemetry.device.mismatch" => {
+                state.settings.engine_link.telemetry = None;
+                state.settings.engine_link.phase =
+                    if state.settings.engine_link.selected_device.is_some() {
+                        EngineLinkPhase::DeviceSelected
+                    } else if state.settings.engine_link.enabled {
+                        EngineLinkPhase::Idle
+                    } else {
+                        EngineLinkPhase::Disabled
+                    };
+                corrections.push("engine-link telemetry reset".to_owned());
+            }
+            "settings.dmx.refresh_rate.out_of_bounds" => {
+                state.settings.dmx.refresh_rate_hz =
+                    state.settings.dmx.refresh_rate_hz.clamp(1, 44);
+                corrections.push("dmx refresh rate clamped".to_owned());
+            }
+            "settings.dmx.enttec.break.out_of_bounds" => {
+                state.settings.dmx.enttec_break_us =
+                    state.settings.dmx.enttec_break_us.clamp(88, 1000);
+                corrections.push("enttec break clamped".to_owned());
+            }
+            "settings.dmx.enttec.mab.out_of_bounds" => {
+                state.settings.dmx.enttec_mark_after_break_us =
+                    state.settings.dmx.enttec_mark_after_break_us.clamp(8, 1000);
+                corrections.push("enttec mark-after-break clamped".to_owned());
+            }
+            "settings.dmx.output.without_interface" => {
+                state.settings.dmx.output_enabled = false;
+                corrections.push("dmx output disabled".to_owned());
+            }
+            "settings.midi.detected_controller.missing_input" => {
+                state.settings.midi.detected_controller = None;
+                corrections.push("detected controller cleared".to_owned());
+            }
+            "settings.midi.learn.target.missing"
+            | "settings.midi.learn.queue.invalid"
+            | "settings.midi.learn.without_input"
+            | "settings.midi.learn.idle_state.invalid" => {
+                state.settings.midi.learn.phase = MidiLearnPhase::Idle;
+                state.settings.midi.learn.target_binding = None;
+                state.settings.midi.learn.capture_queue.clear();
+                state.settings.midi.learn.expected_hint = MidiControlHint::Any;
+                corrections.push("midi learn reset".to_owned());
+            }
+            "settings.midi.binding.duplicate" => {
+                let mut seen = Vec::new();
+                for binding in &mut state.settings.midi.bindings {
+                    if let Some(message) = binding.message.clone() {
+                        if seen.contains(&message) {
+                            binding.message = None;
+                            binding.learned = false;
+                        } else {
+                            seen.push(message);
+                        }
+                    }
+                }
+                corrections.push("duplicate midi bindings cleared".to_owned());
             }
             "snap.guide.out_of_bounds" => {
                 state.timeline.snap.guide = None;
@@ -394,6 +500,100 @@ pub fn recover_state(state: &mut StudioState, report: &ValidationReport) -> Vali
                 }
                 corrections.push("fixture preview nodes clamped".to_owned());
             }
+            "fixture.patch.profile.missing" => {
+                let valid_profiles = state
+                    .fixture_system
+                    .library
+                    .profiles
+                    .iter()
+                    .map(|profile| profile.id.clone())
+                    .collect::<HashSet<_>>();
+                state
+                    .fixture_system
+                    .library
+                    .patches
+                    .retain(|patch| valid_profiles.contains(&patch.profile_id));
+                corrections.push("fixture patches without profile removed".to_owned());
+            }
+            "fixture.patch.mode.missing" => {
+                let profiles = state.fixture_system.library.profiles.clone();
+                for patch in &mut state.fixture_system.library.patches {
+                    if let Some(profile) = profiles
+                        .iter()
+                        .find(|profile| profile.id == patch.profile_id)
+                        && !profile
+                            .modes
+                            .iter()
+                            .any(|mode| mode.name == patch.mode_name)
+                    {
+                        if let Some(mode) = profile.modes.first() {
+                            patch.mode_name = mode.name.clone();
+                        }
+                    }
+                }
+                corrections.push("fixture patch modes corrected".to_owned());
+            }
+            "fixture.patch.group.missing" => {
+                let valid_groups = state
+                    .fixture_system
+                    .groups
+                    .iter()
+                    .map(|group| group.id.0)
+                    .collect::<HashSet<_>>();
+                for patch in &mut state.fixture_system.library.patches {
+                    if patch
+                        .group_id
+                        .map(|group_id| !valid_groups.contains(&group_id.0))
+                        .unwrap_or(false)
+                    {
+                        patch.group_id = None;
+                    }
+                }
+                corrections.push("fixture patch groups cleared".to_owned());
+            }
+            "fixture.patch.address.out_of_bounds" => {
+                for patch in &mut state.fixture_system.library.patches {
+                    patch.address = patch.address.clamp(1, 512);
+                }
+                corrections.push("fixture patch addresses clamped".to_owned());
+            }
+            "fixture.patch.footprint.zero" => {
+                let profiles = state.fixture_system.library.profiles.clone();
+                state.fixture_system.library.patches.retain(|patch| {
+                    profiles
+                        .iter()
+                        .find(|profile| profile.id == patch.profile_id)
+                        .map(|profile| fixture_mode_channel_count(profile, &patch.mode_name) > 0)
+                        .unwrap_or(false)
+                });
+                corrections.push("fixture patches without footprint removed".to_owned());
+            }
+            "fixture.patch.range.out_of_bounds" => {
+                let profiles = state.fixture_system.library.profiles.clone();
+                for patch in &mut state.fixture_system.library.patches {
+                    let Some(profile) = profiles
+                        .iter()
+                        .find(|profile| profile.id == patch.profile_id)
+                    else {
+                        continue;
+                    };
+                    let footprint = fixture_mode_channel_count(profile, &patch.mode_name);
+                    if footprint == 0 {
+                        continue;
+                    }
+
+                    let footprint = u16::try_from(footprint).unwrap_or(512);
+                    let max_start = 513u16.saturating_sub(footprint.max(1));
+                    patch.address = patch.address.clamp(1, max_start.max(1));
+                }
+                corrections.push("fixture patch ranges clamped".to_owned());
+            }
+            "fixture.patch.universe.out_of_bounds" => {
+                for patch in &mut state.fixture_system.library.patches {
+                    patch.universe = patch.universe.clamp(1, 64);
+                }
+                corrections.push("fixture patch universes clamped".to_owned());
+            }
             "fixture.uninitialized.with_online" => {
                 for group in &mut state.fixture_system.groups {
                     if group.phase == FixturePhase::Uninitialized && group.online > 0 {
@@ -541,6 +741,239 @@ fn validate_authoring_extensions(state: &StudioState, issues: &mut Vec<Validatio
     }
 }
 
+fn validate_settings_hardware(state: &StudioState, issues: &mut Vec<ValidationIssue>) {
+    if let Some(selected) = state.settings.dmx.selected_interface.as_deref()
+        && state
+            .settings
+            .dmx
+            .interfaces
+            .iter()
+            .all(|interface| interface.id != selected)
+    {
+        issues.push(issue(
+            ValidationIssueKind::ReferenceIntegrity,
+            "settings.dmx.interface.selected.missing",
+            format!("Selektiertes DMX-Interface {} existiert nicht.", selected),
+        ));
+    }
+
+    if let Some(selected) = state.settings.midi.selected_input.as_deref()
+        && state
+            .settings
+            .midi
+            .inputs
+            .iter()
+            .all(|port| port.id != selected)
+    {
+        issues.push(issue(
+            ValidationIssueKind::ReferenceIntegrity,
+            "settings.midi.input.selected.missing",
+            format!("Selektierter MIDI-Input {} existiert nicht.", selected),
+        ));
+    }
+
+    if let Some(selected) = state.settings.midi.selected_output.as_deref()
+        && state
+            .settings
+            .midi
+            .outputs
+            .iter()
+            .all(|port| port.id != selected)
+    {
+        issues.push(issue(
+            ValidationIssueKind::ReferenceIntegrity,
+            "settings.midi.output.selected.missing",
+            format!("Selektierter MIDI-Output {} existiert nicht.", selected),
+        ));
+    }
+
+    if !(1..=44).contains(&state.settings.dmx.refresh_rate_hz) {
+        issues.push(issue(
+            ValidationIssueKind::TypeConsistency,
+            "settings.dmx.refresh_rate.out_of_bounds",
+            format!(
+                "DMX-Refresh-Rate {} Hz liegt außerhalb 1..=44.",
+                state.settings.dmx.refresh_rate_hz
+            ),
+        ));
+    }
+
+    if !(88..=1000).contains(&state.settings.dmx.enttec_break_us) {
+        issues.push(issue(
+            ValidationIssueKind::TimingConsistency,
+            "settings.dmx.enttec.break.out_of_bounds",
+            format!(
+                "ENTTEC Break {} µs liegt außerhalb 88..=1000.",
+                state.settings.dmx.enttec_break_us
+            ),
+        ));
+    }
+
+    if !(8..=1000).contains(&state.settings.dmx.enttec_mark_after_break_us) {
+        issues.push(issue(
+            ValidationIssueKind::TimingConsistency,
+            "settings.dmx.enttec.mab.out_of_bounds",
+            format!(
+                "ENTTEC Mark After Break {} µs liegt außerhalb 8..=1000.",
+                state.settings.dmx.enttec_mark_after_break_us
+            ),
+        ));
+    }
+
+    if state.settings.dmx.backend == DmxBackendKind::EnttecOpenDmx {
+        match state.selected_dmx_interface() {
+            Some(interface)
+                if !matches!(
+                    interface.kind,
+                    DmxInterfaceKind::EnttecOpenDmxCompatible | DmxInterfaceKind::UsbSerial
+                ) =>
+            {
+                issues.push(issue(
+                    ValidationIssueKind::ReferenceIntegrity,
+                    "settings.dmx.enttec.interface.incompatible",
+                    format!(
+                        "Das selektierte DMX-Interface {} ist nicht ENTTEC/Open-DMX-kompatibel.",
+                        interface.name
+                    ),
+                ));
+            }
+            None if state.settings.dmx.output_enabled => {
+                issues.push(issue(
+                    ValidationIssueKind::StateConsistency,
+                    "settings.dmx.output.without_interface",
+                    "DMX-Output ist aktiviert, aber kein Interface ist selektiert.".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    if state.settings.midi.detected_controller.is_some() && state.selected_midi_input().is_none() {
+        issues.push(issue(
+            ValidationIssueKind::StateConsistency,
+            "settings.midi.detected_controller.missing_input",
+            "Ein erkannter Controller ohne selektierten MIDI-Input ist nicht konsistent."
+                .to_owned(),
+        ));
+    }
+
+    if state.settings.midi.learn.phase != MidiLearnPhase::Idle
+        && state.selected_midi_input().is_none()
+    {
+        issues.push(issue(
+            ValidationIssueKind::StateConsistency,
+            "settings.midi.learn.without_input",
+            "MIDI Learn ist aktiv, aber kein MIDI-Input ist selektiert.".to_owned(),
+        ));
+    }
+
+    if state.settings.midi.learn.phase == MidiLearnPhase::Idle
+        && (state.settings.midi.learn.target_binding.is_some()
+            || !state.settings.midi.learn.capture_queue.is_empty())
+    {
+        issues.push(issue(
+            ValidationIssueKind::StateConsistency,
+            "settings.midi.learn.idle_state.invalid",
+            "Der MIDI-Learn-State ist idle, hält aber noch Targets oder Queue-Einträge.".to_owned(),
+        ));
+    }
+
+    if let Some(target_binding) = state.settings.midi.learn.target_binding
+        && state.midi_binding(target_binding).is_none()
+    {
+        issues.push(issue(
+            ValidationIssueKind::ReferenceIntegrity,
+            "settings.midi.learn.target.missing",
+            format!(
+                "MIDI Learn referenziert unbekanntes Binding {}.",
+                target_binding
+            ),
+        ));
+    }
+
+    let valid_binding_ids = state
+        .settings
+        .midi
+        .bindings
+        .iter()
+        .map(|binding| binding.id)
+        .collect::<HashSet<_>>();
+    if state
+        .settings
+        .midi
+        .learn
+        .capture_queue
+        .iter()
+        .any(|binding_id| !valid_binding_ids.contains(binding_id))
+    {
+        issues.push(issue(
+            ValidationIssueKind::ReferenceIntegrity,
+            "settings.midi.learn.queue.invalid",
+            "Die MIDI-Learn-Queue enthält unbekannte Binding-Ids.".to_owned(),
+        ));
+    }
+
+    let mut seen_messages = Vec::new();
+    for binding in &state.settings.midi.bindings {
+        if let Some(message) = &binding.message {
+            if seen_messages.contains(message) {
+                issues.push(issue(
+                    ValidationIssueKind::Determinism,
+                    "settings.midi.binding.duplicate",
+                    format!("MIDI-Binding {} dupliziert {}.", binding.id, binding.label),
+                ));
+            } else {
+                seen_messages.push(message.clone());
+            }
+        }
+    }
+}
+
+fn validate_engine_link(state: &StudioState, issues: &mut Vec<ValidationIssue>) {
+    if !(1_024..=65_535).contains(&state.settings.engine_link.discovery_port) {
+        issues.push(issue(
+            ValidationIssueKind::TypeConsistency,
+            "settings.engine.discovery_port.out_of_bounds",
+            format!(
+                "Engine-Link Discovery-Port {} liegt außerhalb 1024..=65535.",
+                state.settings.engine_link.discovery_port
+            ),
+        ));
+    }
+
+    if let Some(selected) = state.settings.engine_link.selected_device.as_deref()
+        && state
+            .settings
+            .engine_link
+            .devices
+            .iter()
+            .all(|device| device.id != selected)
+    {
+        issues.push(issue(
+            ValidationIssueKind::ReferenceIntegrity,
+            "settings.engine.device.selected.missing",
+            format!(
+                "Selektiertes Engine-Link-Device {} existiert nicht.",
+                selected
+            ),
+        ));
+    }
+
+    if let Some(telemetry) = state.settings.engine_link.telemetry.as_ref()
+        && let Some(selected) = state.settings.engine_link.selected_device.as_deref()
+        && selected != telemetry.device_id
+    {
+        issues.push(issue(
+            ValidationIssueKind::StateConsistency,
+            "settings.engine.telemetry.device.mismatch",
+            format!(
+                "Engine-Link-Telemetrie {} passt nicht zur Selektions-Id {}.",
+                telemetry.device_id, selected
+            ),
+        ));
+    }
+}
+
 fn validate_ids(state: &StudioState, issues: &mut Vec<ValidationIssue>) {
     let mut track_ids = HashSet::new();
     let mut clip_ids = HashSet::new();
@@ -548,6 +981,8 @@ fn validate_ids(state: &StudioState, issues: &mut Vec<ValidationIssue>) {
     let mut chase_ids = HashSet::new();
     let mut fx_ids = HashSet::new();
     let mut fixture_ids = HashSet::new();
+    let mut fixture_profile_ids = HashSet::new();
+    let mut fixture_patch_ids = HashSet::new();
 
     for track in &state.timeline.tracks {
         if !track_ids.insert(track.id.0) {
@@ -605,6 +1040,26 @@ fn validate_ids(state: &StudioState, issues: &mut Vec<ValidationIssue>) {
                 ValidationIssueKind::ReferenceIntegrity,
                 "fixture.id.duplicate",
                 format!("FixtureGroupId {} ist nicht eindeutig.", group.id.0),
+            ));
+        }
+    }
+
+    for profile in &state.fixture_system.library.profiles {
+        if !fixture_profile_ids.insert(profile.id.clone()) {
+            issues.push(issue(
+                ValidationIssueKind::ReferenceIntegrity,
+                "fixture.profile.id.duplicate",
+                format!("Fixture-Profil {} ist nicht eindeutig.", profile.id),
+            ));
+        }
+    }
+
+    for patch in &state.fixture_system.library.patches {
+        if !fixture_patch_ids.insert(patch.id) {
+            issues.push(issue(
+                ValidationIssueKind::ReferenceIntegrity,
+                "fixture.patch.id.duplicate",
+                format!("Fixture-Patch {} ist nicht eindeutig.", patch.id),
             ));
         }
     }
@@ -730,6 +1185,29 @@ fn validate_selection_and_hover(state: &StudioState, issues: &mut Vec<Validation
             ValidationIssueKind::ReferenceIntegrity,
             "selection.fixture.missing",
             format!("Selektierte Fixture-Gruppe {} existiert nicht.", group_id.0),
+        ));
+    }
+
+    if let Some(profile_id) = state.fixture_system.library.selected_profile.as_deref()
+        && state.fixture_profile(profile_id).is_none()
+    {
+        issues.push(issue(
+            ValidationIssueKind::ReferenceIntegrity,
+            "fixture.profile.selected.missing",
+            format!(
+                "Selektiertes Fixture-Profil {} existiert nicht.",
+                profile_id
+            ),
+        ));
+    }
+
+    if let Some(patch_id) = state.fixture_system.library.selected_patch
+        && state.fixture_patch(patch_id).is_none()
+    {
+        issues.push(issue(
+            ValidationIssueKind::ReferenceIntegrity,
+            "fixture.patch.selected.missing",
+            format!("Selektierter Fixture-Patch {} existiert nicht.", patch_id),
         ));
     }
 
@@ -1030,6 +1508,108 @@ fn validate_show_references(state: &StudioState, issues: &mut Vec<ValidationIssu
             }
         }
     }
+
+    for patch in &state.fixture_system.library.patches {
+        let Some(profile) = state.fixture_profile(&patch.profile_id) else {
+            issues.push(issue(
+                ValidationIssueKind::ReferenceIntegrity,
+                "fixture.patch.profile.missing",
+                format!(
+                    "Fixture-Patch {} referenziert unbekanntes Profil {}.",
+                    patch.id, patch.profile_id
+                ),
+            ));
+            continue;
+        };
+
+        if !profile
+            .modes
+            .iter()
+            .any(|mode| mode.name == patch.mode_name)
+        {
+            issues.push(issue(
+                ValidationIssueKind::ReferenceIntegrity,
+                "fixture.patch.mode.missing",
+                format!(
+                    "Fixture-Patch {} referenziert unbekannten Mode {}.",
+                    patch.id, patch.mode_name
+                ),
+            ));
+        }
+
+        if !(1..=64).contains(&patch.universe) {
+            issues.push(issue(
+                ValidationIssueKind::TypeConsistency,
+                "fixture.patch.universe.out_of_bounds",
+                format!(
+                    "Fixture-Patch {} liegt auf ungueltigem Universe {}.",
+                    patch.id, patch.universe
+                ),
+            ));
+        }
+
+        if !(1..=512).contains(&patch.address) {
+            issues.push(issue(
+                ValidationIssueKind::TypeConsistency,
+                "fixture.patch.address.out_of_bounds",
+                format!(
+                    "Fixture-Patch {} liegt auf ungueltiger Adresse {}.",
+                    patch.id, patch.address
+                ),
+            ));
+        }
+
+        if let Some(group_id) = patch.group_id
+            && state.fixture_group(group_id).is_none()
+        {
+            issues.push(issue(
+                ValidationIssueKind::ReferenceIntegrity,
+                "fixture.patch.group.missing",
+                format!(
+                    "Fixture-Patch {} referenziert unbekannte Gruppe {}.",
+                    patch.id, group_id.0
+                ),
+            ));
+        }
+
+        let footprint = state.fixture_patch_channel_count(patch).unwrap_or(0);
+        if footprint == 0 {
+            issues.push(issue(
+                ValidationIssueKind::TypeConsistency,
+                "fixture.patch.footprint.zero",
+                format!(
+                    "Fixture-Patch {} besitzt keinen gueltigen DMX-Footprint.",
+                    patch.id
+                ),
+            ));
+            continue;
+        }
+
+        let end_address = patch.address.saturating_add(footprint.saturating_sub(1));
+        if end_address > 512 {
+            issues.push(issue(
+                ValidationIssueKind::TimingConsistency,
+                "fixture.patch.range.out_of_bounds",
+                format!(
+                    "Fixture-Patch {} belegt U{}.{}-{} und endet hinter Kanal 512.",
+                    patch.id, patch.universe, patch.address, end_address
+                ),
+            ));
+        }
+    }
+
+    for summary in state.fixture_universe_summaries() {
+        if !summary.conflicting_patch_ids.is_empty() {
+            issues.push(issue(
+                ValidationIssueKind::StateConsistency,
+                "fixture.patch.address.conflict",
+                format!(
+                    "Universe {} enthaelt ueberlappende Fixture-Patches {:?}.",
+                    summary.universe, summary.conflicting_patch_ids
+                ),
+            ));
+        }
+    }
 }
 
 fn validate_event_queue(state: &StudioState, issues: &mut Vec<ValidationIssue>) {
@@ -1098,7 +1678,12 @@ fn issue(kind: ValidationIssueKind, code: &str, detail: String) -> ValidationIss
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BeatTime, ClipId, CueId, FixtureGroupId, SelectionState, StudioState};
+    use crate::core::{
+        BeatTime, ClipId, CueId, EngineDeckFollowMode, EngineDeckPhase, EnginePrimeDevice,
+        EngineTelemetryFrame, FixtureGroupId, FixtureMode, FixturePatch, FixtureProfile,
+        FixtureSourceInfo, FixtureSourceKind, IntensityLevel, MidiBinding, MidiBindingMessage,
+        MidiControlHint, MidiLearnPhase, MidiMessageKind, SelectionState, StudioState, TempoBpm,
+    };
 
     #[test]
     fn validation_detects_missing_selected_clip() {
@@ -1305,5 +1890,311 @@ mod tests {
 
         assert!(recovered.valid);
         assert!(state.venture.selected_recovery.is_none());
+    }
+
+    #[test]
+    fn recovery_resets_missing_selected_fixture_profile() {
+        let mut state = StudioState::default();
+        state.fixture_system.library.selected_profile = Some("ghost-profile".to_owned());
+
+        let report = validate_state(&state);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "fixture.profile.selected.missing")
+        );
+
+        let recovered = recover_state(&mut state, &report);
+
+        assert!(recovered.valid);
+        assert!(state.fixture_system.library.selected_profile.is_none());
+    }
+
+    #[test]
+    fn recovery_corrects_invalid_fixture_patch_references() {
+        let mut state = StudioState::default();
+        let profile = crate::core::import_ofl_fixture(
+            r#"{
+              "$schema":"https://raw.githubusercontent.com/OpenLightingProject/open-fixture-library/master/schemas/fixture.json",
+              "name":"Demo Bar 8",
+              "categories":["Pixel Bar"],
+              "meta":{"authors":["Tester"],"createDate":"2024-01-01","lastModifyDate":"2024-01-02"},
+              "availableChannels":{
+                "Dimmer":{"capability":{"type":"Intensity"}},
+                "Red":{"capability":{"type":"ColorIntensity","color":"Red"}}
+              },
+              "modes":[{"name":"2ch","channels":["Dimmer","Red"]}]
+            }"#,
+            Some("demo"),
+            Some("demo-bar-8"),
+        )
+        .expect("fixture profile");
+        state.fixture_system.library.profiles.push(profile.clone());
+        state
+            .fixture_system
+            .library
+            .patches
+            .push(crate::core::FixturePatch {
+                id: 1,
+                profile_id: profile.id,
+                name: "Broken Patch".to_owned(),
+                mode_name: "ghost-mode".to_owned(),
+                universe: 0,
+                address: 0,
+                group_id: Some(FixtureGroupId(999)),
+                enabled: true,
+            });
+        state.fixture_system.library.selected_patch = Some(1);
+
+        let report = validate_state(&state);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "fixture.patch.mode.missing")
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "fixture.patch.address.out_of_bounds")
+        );
+
+        let recovered = recover_state(&mut state, &report);
+
+        assert!(recovered.valid);
+        let patch = state
+            .fixture_system
+            .library
+            .patches
+            .first()
+            .expect("patch survives");
+        assert_eq!(patch.mode_name, "2ch");
+        assert_eq!(patch.universe, 1);
+        assert_eq!(patch.address, 1);
+        assert_eq!(patch.group_id, None);
+    }
+
+    #[test]
+    fn validation_detects_fixture_patch_universe_overlap() {
+        let mut state = StudioState::default();
+        state.fixture_system.library.profiles = vec![FixtureProfile {
+            id: "fixture.overlap".to_owned(),
+            manufacturer: "Test".to_owned(),
+            model: "Overlap".to_owned(),
+            short_name: "Overlap".to_owned(),
+            categories: vec!["Spot".to_owned()],
+            physical: None,
+            channels: Vec::new(),
+            modes: vec![FixtureMode {
+                name: "4ch".to_owned(),
+                short_name: None,
+                channels: vec![
+                    "Dimmer".to_owned(),
+                    "Red".to_owned(),
+                    "Green".to_owned(),
+                    "Blue".to_owned(),
+                ],
+            }],
+            source: FixtureSourceInfo {
+                kind: FixtureSourceKind::Demo,
+                manufacturer_key: None,
+                fixture_key: None,
+                source_path: None,
+                ofl_url: None,
+                creator_name: None,
+                creator_version: None,
+            },
+        }];
+        state.fixture_system.library.patches = vec![
+            FixturePatch {
+                id: 1,
+                profile_id: "fixture.overlap".to_owned(),
+                name: "A".to_owned(),
+                mode_name: "4ch".to_owned(),
+                universe: 1,
+                address: 1,
+                group_id: Some(FixtureGroupId(1)),
+                enabled: true,
+            },
+            FixturePatch {
+                id: 2,
+                profile_id: "fixture.overlap".to_owned(),
+                name: "B".to_owned(),
+                mode_name: "4ch".to_owned(),
+                universe: 1,
+                address: 4,
+                group_id: Some(FixtureGroupId(1)),
+                enabled: true,
+            },
+        ];
+
+        let report = validate_state(&state);
+
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "fixture.patch.address.conflict")
+        );
+    }
+
+    #[test]
+    fn recovery_resets_missing_selected_engine_device() {
+        let mut state = StudioState::default();
+        state.settings.engine_link.enabled = true;
+        state.settings.engine_link.selected_device = Some("ghost-prime".to_owned());
+        state.settings.engine_link.adopt_transport = true;
+        state.settings.engine_link.follow_mode = EngineDeckFollowMode::MasterDeck;
+        state.settings.engine_link.telemetry = Some(EngineTelemetryFrame {
+            device_id: "ghost-prime".to_owned(),
+            decks: vec![crate::core::EngineDeckTelemetry {
+                deck_index: 1,
+                track_name: "Track".to_owned(),
+                artist_name: "Artist".to_owned(),
+                bpm: TempoBpm::from_whole_bpm(128),
+                beat: BeatTime::from_beats(8),
+                phase: EngineDeckPhase::Playing,
+                is_master: true,
+                is_synced: true,
+            }],
+            mixer: crate::core::EngineMixerTelemetry {
+                crossfader: IntensityLevel::from_permille(500),
+                channel_faders: vec![IntensityLevel::from_permille(1000)],
+            },
+            summary: "Ghost engine frame".to_owned(),
+        });
+
+        let report = validate_state(&state);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "settings.engine.device.selected.missing")
+        );
+
+        let recovered = recover_state(&mut state, &report);
+
+        assert!(recovered.valid);
+        assert!(state.settings.engine_link.selected_device.is_none());
+        assert!(state.settings.engine_link.telemetry.is_none());
+    }
+
+    #[test]
+    fn validation_detects_engine_telemetry_device_mismatch() {
+        let mut state = StudioState::default();
+        state.settings.engine_link.enabled = true;
+        state.settings.engine_link.devices = vec![EnginePrimeDevice {
+            id: "prime".to_owned(),
+            name: "Denon Prime 2".to_owned(),
+            address: "192.168.1.50".to_owned(),
+            software_name: "Engine DJ".to_owned(),
+            software_version: "4.1.0".to_owned(),
+            announce_port: 51_337,
+            service_port: Some(50_010),
+            token_hint: None,
+            services: Vec::new(),
+            detail: "Prime".to_owned(),
+            last_seen_frame: 0,
+        }];
+        state.settings.engine_link.selected_device = Some("prime".to_owned());
+        state.settings.engine_link.telemetry = Some(EngineTelemetryFrame {
+            device_id: "other".to_owned(),
+            decks: vec![crate::core::EngineDeckTelemetry {
+                deck_index: 1,
+                track_name: "Track".to_owned(),
+                artist_name: "Artist".to_owned(),
+                bpm: TempoBpm::from_whole_bpm(128),
+                beat: BeatTime::from_beats(8),
+                phase: EngineDeckPhase::Playing,
+                is_master: true,
+                is_synced: true,
+            }],
+            mixer: crate::core::EngineMixerTelemetry {
+                crossfader: IntensityLevel::from_permille(500),
+                channel_faders: vec![IntensityLevel::from_permille(1000)],
+            },
+            summary: "Mismatch".to_owned(),
+        });
+
+        let report = validate_state(&state);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "settings.engine.telemetry.device.mismatch")
+        );
+    }
+
+    #[test]
+    fn recovery_resets_missing_selected_midi_input_and_learn_state() {
+        let mut state = StudioState::default();
+        state.settings.midi.selected_input = Some("ghost-midi".to_owned());
+        state.settings.midi.detected_controller =
+            Some(crate::core::ControllerProfileKind::Apc40Mk2);
+        state.settings.midi.learn.phase = MidiLearnPhase::Listening;
+        state.settings.midi.learn.target_binding = Some(42);
+
+        let report = validate_state(&state);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "settings.midi.input.selected.missing")
+        );
+
+        let recovered = recover_state(&mut state, &report);
+
+        assert!(recovered.valid);
+        assert!(state.settings.midi.selected_input.is_none());
+        assert!(state.settings.midi.detected_controller.is_none());
+        assert_eq!(state.settings.midi.learn.phase, MidiLearnPhase::Idle);
+        assert!(state.settings.midi.learn.target_binding.is_none());
+    }
+
+    #[test]
+    fn recovery_deduplicates_midi_bindings() {
+        let mut state = StudioState::default();
+        let duplicate_message = MidiBindingMessage {
+            kind: MidiMessageKind::ControlChange,
+            channel: 1,
+            key: 21,
+        };
+        state.settings.midi.bindings = vec![
+            MidiBinding {
+                id: 1,
+                action: crate::core::MidiAction::MasterIntensity,
+                label: "Master".to_owned(),
+                message: Some(duplicate_message.clone()),
+                hint: MidiControlHint::Continuous,
+                learned: true,
+                controller_profile: None,
+            },
+            MidiBinding {
+                id: 2,
+                action: crate::core::MidiAction::MasterSpeed,
+                label: "Speed".to_owned(),
+                message: Some(duplicate_message),
+                hint: MidiControlHint::Continuous,
+                learned: true,
+                controller_profile: None,
+            },
+        ];
+
+        let report = validate_state(&state);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "settings.midi.binding.duplicate")
+        );
+
+        let recovered = recover_state(&mut state, &report);
+
+        assert!(recovered.valid);
+        assert!(state.settings.midi.bindings[0].message.is_some());
+        assert!(state.settings.midi.bindings[1].message.is_none());
+        assert!(!state.settings.midi.bindings[1].learned);
     }
 }

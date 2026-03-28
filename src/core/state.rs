@@ -1,4 +1,5 @@
 use crate::core::event::{AppEvent, StateDiff};
+use crate::core::fixtures::fixture_mode_channel_count;
 use crate::core::ids::{ChaseId, ClipId, CueId, FixtureGroupId, FxId, TrackId};
 use crate::core::queue::EventQueueState;
 use crate::core::time::{
@@ -367,10 +368,149 @@ pub struct FixturePreviewNode {
     pub z_permille: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FixtureLibraryPhase {
+    Idle,
+    Importing,
+    Exporting,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FixtureSourceKind {
+    Demo,
+    OpenFixtureLibrary,
+    Qxf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixtureSourceInfo {
+    pub kind: FixtureSourceKind,
+    pub manufacturer_key: Option<String>,
+    pub fixture_key: Option<String>,
+    pub source_path: Option<String>,
+    pub ofl_url: Option<String>,
+    pub creator_name: Option<String>,
+    pub creator_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixturePhysical {
+    pub dimensions_mm: Option<[u16; 3]>,
+    pub weight_grams: Option<u32>,
+    pub power_watts: Option<u16>,
+    pub dmx_connector: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixtureCapability {
+    pub start: u16,
+    pub end: u16,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixtureChannel {
+    pub name: String,
+    pub group: String,
+    pub byte: u8,
+    pub default_value: u16,
+    pub highlight_value: u16,
+    pub capabilities: Vec<FixtureCapability>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixtureMode {
+    pub name: String,
+    pub short_name: Option<String>,
+    pub channels: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixtureProfile {
+    pub id: String,
+    pub manufacturer: String,
+    pub model: String,
+    pub short_name: String,
+    pub categories: Vec<String>,
+    pub physical: Option<FixturePhysical>,
+    pub channels: Vec<FixtureChannel>,
+    pub modes: Vec<FixtureMode>,
+    pub source: FixtureSourceInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixturePatch {
+    pub id: u32,
+    pub profile_id: String,
+    pub name: String,
+    pub mode_name: String,
+    pub universe: u16,
+    pub address: u16,
+    pub group_id: Option<FixtureGroupId>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixtureLibraryState {
+    pub phase: FixtureLibraryPhase,
+    pub selected_profile: Option<String>,
+    pub selected_patch: Option<u32>,
+    pub profiles: Vec<FixtureProfile>,
+    pub patches: Vec<FixturePatch>,
+    pub ofl_manufacturer_key: String,
+    pub ofl_fixture_key: String,
+    pub qxf_import_path: String,
+    pub qxf_export_path: String,
+    pub last_summary: Option<String>,
+    pub last_error: Option<String>,
+}
+
+impl Default for FixtureLibraryState {
+    fn default() -> Self {
+        Self {
+            phase: FixtureLibraryPhase::Idle,
+            selected_profile: None,
+            selected_patch: None,
+            profiles: Vec::new(),
+            patches: Vec::new(),
+            ofl_manufacturer_key: String::new(),
+            ofl_fixture_key: String::new(),
+            qxf_import_path: String::new(),
+            qxf_export_path: String::new(),
+            last_summary: None,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixtureUniverseSummary {
+    pub universe: u16,
+    pub patch_count: usize,
+    pub enabled_patch_count: usize,
+    pub footprint_channels: u16,
+    pub occupied_channels: u16,
+    pub highest_address: u16,
+    pub conflicting_patch_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixtureGroupPatchSummary {
+    pub group_id: FixtureGroupId,
+    pub patch_count: usize,
+    pub enabled_patch_count: usize,
+    pub footprint_channels: u16,
+    pub occupied_channels: u16,
+    pub universes: Vec<u16>,
+    pub conflicting_patch_ids: Vec<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FixtureSystemState {
     pub selected: Option<FixtureGroupId>,
     pub groups: Vec<FixtureGroup>,
+    pub library: FixtureLibraryState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -596,6 +736,7 @@ pub struct HistorySnapshot {
     pub chase_system: ChaseSystemState,
     pub fx_system: FxSystemState,
     pub fixture_system: FixtureSystemState,
+    pub settings: SettingsState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -678,6 +819,7 @@ struct VentureAuthoringSignature {
     pub chase_system: ChaseSystemState,
     pub fx_system: FxSystemState,
     pub fixture_system: FixtureSystemState,
+    pub settings: SettingsState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -723,6 +865,425 @@ impl Default for VentureState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SettingsTab {
+    General,
+    Dmx,
+    Midi,
+    Controllers,
+    Engine,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HardwareDiscoveryPhase {
+    Idle,
+    Refreshing,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DmxBackendKind {
+    Disabled,
+    EnttecOpenDmx,
+    ArtNet,
+    Sacn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutputDeliveryPhase {
+    Idle,
+    Dispatching,
+    Delivered,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputDispatchReport {
+    pub sequence: u64,
+    pub dmx_backend: DmxBackendKind,
+    pub dmx_frame_count: u16,
+    pub midi_message_count: u16,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputRuntimeState {
+    pub phase: OutputDeliveryPhase,
+    pub sequence: u64,
+    pub last_backend: DmxBackendKind,
+    pub last_dmx_frame_count: u16,
+    pub last_midi_message_count: u16,
+    pub last_summary: Option<String>,
+    pub last_error: Option<String>,
+}
+
+impl Default for OutputRuntimeState {
+    fn default() -> Self {
+        Self {
+            phase: OutputDeliveryPhase::Idle,
+            sequence: 0,
+            last_backend: DmxBackendKind::Disabled,
+            last_dmx_frame_count: 0,
+            last_midi_message_count: 0,
+            last_summary: None,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DmxInterfaceKind {
+    EnttecOpenDmxCompatible,
+    UsbSerial,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DmxInterfaceDescriptor {
+    pub id: String,
+    pub name: String,
+    pub kind: DmxInterfaceKind,
+    pub port_name: String,
+    pub manufacturer: Option<String>,
+    pub product: Option<String>,
+    pub serial_number: Option<String>,
+    pub detail: String,
+    pub universe_capacity: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MidiPortDirection {
+    Input,
+    Output,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ControllerProfileKind {
+    Apc40Mk2,
+    DenonPrime2,
+    BehringerCmdDc1,
+    BehringerCmdLc1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MidiPortDescriptor {
+    pub id: String,
+    pub name: String,
+    pub direction: MidiPortDirection,
+    pub profile_hint: Option<ControllerProfileKind>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MidiMessageKind {
+    Note,
+    ControlChange,
+    PitchBend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MidiControlHint {
+    Button,
+    Continuous,
+    Any,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MidiBindingMessage {
+    pub kind: MidiMessageKind,
+    pub channel: u8,
+    pub key: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MidiRuntimeMessage {
+    pub timestamp_micros: u64,
+    pub kind: MidiMessageKind,
+    pub channel: u8,
+    pub key: u8,
+    pub value: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MidiAction {
+    TransportToggle,
+    MasterIntensity,
+    MasterSpeed,
+    TimelineZoom,
+    TriggerCueSlot(u8),
+    TriggerChaseSlot(u8),
+    FocusFixtureGroupSlot(u8),
+    FxDepthSlot(u8),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MidiBinding {
+    pub id: u32,
+    pub action: MidiAction,
+    pub label: String,
+    pub message: Option<MidiBindingMessage>,
+    pub hint: MidiControlHint,
+    pub learned: bool,
+    pub controller_profile: Option<ControllerProfileKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MidiLearnPhase {
+    Idle,
+    Listening,
+    GuidedAutomap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MidiLearnState {
+    pub phase: MidiLearnPhase,
+    pub target_binding: Option<u32>,
+    pub capture_queue: Vec<u32>,
+    pub expected_hint: MidiControlHint,
+    pub last_captured: Option<MidiBindingMessage>,
+}
+
+impl Default for MidiLearnState {
+    fn default() -> Self {
+        Self {
+            phase: MidiLearnPhase::Idle,
+            target_binding: None,
+            capture_queue: Vec::new(),
+            expected_hint: MidiControlHint::Any,
+            last_captured: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DmxSettingsState {
+    pub phase: HardwareDiscoveryPhase,
+    pub backend: DmxBackendKind,
+    pub output_enabled: bool,
+    pub auto_connect: bool,
+    pub blackout_on_stop: bool,
+    pub selected_interface: Option<String>,
+    pub interfaces: Vec<DmxInterfaceDescriptor>,
+    pub artnet_target: String,
+    pub artnet_universe: u16,
+    pub sacn_target: String,
+    pub sacn_universe: u16,
+    pub refresh_rate_hz: u16,
+    pub enttec_break_us: u16,
+    pub enttec_mark_after_break_us: u16,
+    pub last_summary: Option<String>,
+    pub last_error: Option<String>,
+}
+
+impl Default for DmxSettingsState {
+    fn default() -> Self {
+        Self {
+            phase: HardwareDiscoveryPhase::Idle,
+            backend: DmxBackendKind::Disabled,
+            output_enabled: false,
+            auto_connect: true,
+            blackout_on_stop: true,
+            selected_interface: None,
+            interfaces: Vec::new(),
+            artnet_target: "255.255.255.255:6454".to_owned(),
+            artnet_universe: 1,
+            sacn_target: "239.255.0.1:5568".to_owned(),
+            sacn_universe: 1,
+            refresh_rate_hz: 30,
+            enttec_break_us: 176,
+            enttec_mark_after_break_us: 16,
+            last_summary: None,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MidiSettingsState {
+    pub phase: HardwareDiscoveryPhase,
+    pub selected_input: Option<String>,
+    pub selected_output: Option<String>,
+    pub inputs: Vec<MidiPortDescriptor>,
+    pub outputs: Vec<MidiPortDescriptor>,
+    pub feedback_enabled: bool,
+    pub bindings: Vec<MidiBinding>,
+    pub learn: MidiLearnState,
+    pub detected_controller: Option<ControllerProfileKind>,
+    pub last_message: Option<MidiRuntimeMessage>,
+    pub last_summary: Option<String>,
+    pub last_error: Option<String>,
+}
+
+impl Default for MidiSettingsState {
+    fn default() -> Self {
+        Self {
+            phase: HardwareDiscoveryPhase::Idle,
+            selected_input: None,
+            selected_output: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            feedback_enabled: true,
+            bindings: Vec::new(),
+            learn: MidiLearnState::default(),
+            detected_controller: None,
+            last_message: None,
+            last_summary: None,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EngineLinkMode {
+    Disabled,
+    StageLinqExperimental,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EngineLinkPhase {
+    Disabled,
+    Idle,
+    Discovering,
+    DeviceSelected,
+    Monitoring,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EngineDeckFollowMode {
+    Disabled,
+    Deck1,
+    Deck2,
+    MasterDeck,
+    AnyPlayingDeck,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EngineDeckPhase {
+    Idle,
+    Paused,
+    Playing,
+    Cueing,
+    Syncing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineServiceDescriptor {
+    pub name: String,
+    pub port: u16,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnginePrimeDevice {
+    pub id: String,
+    pub name: String,
+    pub address: String,
+    pub software_name: String,
+    pub software_version: String,
+    pub announce_port: u16,
+    pub service_port: Option<u16>,
+    pub token_hint: Option<String>,
+    pub services: Vec<EngineServiceDescriptor>,
+    pub detail: String,
+    pub last_seen_frame: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineDeckTelemetry {
+    pub deck_index: u8,
+    pub track_name: String,
+    pub artist_name: String,
+    pub bpm: TempoBpm,
+    pub beat: BeatTime,
+    pub phase: EngineDeckPhase,
+    pub is_master: bool,
+    pub is_synced: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineMixerTelemetry {
+    pub crossfader: IntensityLevel,
+    pub channel_faders: Vec<IntensityLevel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineTelemetryFrame {
+    pub device_id: String,
+    pub decks: Vec<EngineDeckTelemetry>,
+    pub mixer: EngineMixerTelemetry,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineLinkState {
+    pub mode: EngineLinkMode,
+    pub phase: EngineLinkPhase,
+    pub enabled: bool,
+    pub auto_connect: bool,
+    pub adopt_transport: bool,
+    pub follow_mode: EngineDeckFollowMode,
+    pub discovery_port: u16,
+    pub selected_device: Option<String>,
+    pub devices: Vec<EnginePrimeDevice>,
+    pub telemetry: Option<EngineTelemetryFrame>,
+    pub last_summary: Option<String>,
+    pub last_error: Option<String>,
+}
+
+impl Default for EngineLinkState {
+    fn default() -> Self {
+        Self {
+            mode: EngineLinkMode::StageLinqExperimental,
+            phase: EngineLinkPhase::Disabled,
+            enabled: false,
+            auto_connect: true,
+            adopt_transport: false,
+            follow_mode: EngineDeckFollowMode::MasterDeck,
+            discovery_port: 51_337,
+            selected_device: None,
+            devices: Vec::new(),
+            telemetry: None,
+            last_summary: None,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsState {
+    pub selected_tab: SettingsTab,
+    pub show_fps_overlay: bool,
+    pub show_cpu_overlay: bool,
+    pub smooth_playhead: bool,
+    pub follow_playhead: bool,
+    pub dmx: DmxSettingsState,
+    pub midi: MidiSettingsState,
+    pub engine_link: EngineLinkState,
+}
+
+impl Default for SettingsState {
+    fn default() -> Self {
+        Self {
+            selected_tab: SettingsTab::General,
+            show_fps_overlay: true,
+            show_cpu_overlay: true,
+            smooth_playhead: true,
+            follow_playhead: true,
+            dmx: DmxSettingsState::default(),
+            midi: MidiSettingsState::default(),
+            engine_link: EngineLinkState::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct HardwareInventorySnapshot {
+    pub dmx_interfaces: Vec<DmxInterfaceDescriptor>,
+    pub midi_inputs: Vec<MidiPortDescriptor>,
+    pub midi_outputs: Vec<MidiPortDescriptor>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RenderRevisionState {
     pub grid: u64,
@@ -750,6 +1311,8 @@ pub struct StudioState {
     pub performance: PerformanceState,
     pub status: StatusBarState,
     pub venture: VentureState,
+    pub settings: SettingsState,
+    pub output: OutputRuntimeState,
     pub history: HistoryState,
     pub revisions: RenderRevisionState,
 }
@@ -818,6 +1381,7 @@ impl Default for StudioState {
             fixture_system: FixtureSystemState {
                 selected: Some(FixtureGroupId(1)),
                 groups: demo_fixture_groups(),
+                library: FixtureLibraryState::default(),
             },
             input_modifiers: InputModifiersState::default(),
             context_menu: ContextMenuState::default(),
@@ -835,6 +1399,8 @@ impl Default for StudioState {
                 last_diffs: vec![StateDiff::Engine, StateDiff::TimelineViewport],
             },
             venture: VentureState::default(),
+            settings: SettingsState::default(),
+            output: OutputRuntimeState::default(),
             history: HistoryState::default(),
             revisions: RenderRevisionState {
                 grid: 1,
@@ -1087,6 +1653,409 @@ impl StudioState {
             .and_then(|group_id| self.fixture_group(group_id))
     }
 
+    pub fn fixture_profile(&self, profile_id: &str) -> Option<&FixtureProfile> {
+        self.fixture_system
+            .library
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+    }
+
+    pub fn selected_fixture_profile(&self) -> Option<&FixtureProfile> {
+        self.fixture_system
+            .library
+            .selected_profile
+            .as_deref()
+            .and_then(|profile_id| self.fixture_profile(profile_id))
+    }
+
+    pub fn fixture_patch(&self, patch_id: u32) -> Option<&FixturePatch> {
+        self.fixture_system
+            .library
+            .patches
+            .iter()
+            .find(|patch| patch.id == patch_id)
+    }
+
+    pub fn selected_fixture_patch(&self) -> Option<&FixturePatch> {
+        self.fixture_system
+            .library
+            .selected_patch
+            .and_then(|patch_id| self.fixture_patch(patch_id))
+    }
+
+    pub fn fixture_patch_channel_count(&self, patch: &FixturePatch) -> Option<u16> {
+        let profile = self.fixture_profile(&patch.profile_id)?;
+        let count = fixture_mode_channel_count(profile, &patch.mode_name);
+        u16::try_from(count).ok()
+    }
+
+    pub fn fixture_patch_end_address(&self, patch: &FixturePatch) -> Option<u16> {
+        self.fixture_patch_range(patch).map(|(_, end)| end)
+    }
+
+    pub fn fixture_patch_conflicts(&self, patch_id: u32) -> Vec<u32> {
+        let Some(patch) = self.fixture_patch(patch_id) else {
+            return Vec::new();
+        };
+        let Some((start, end)) = self.fixture_patch_range(patch) else {
+            return Vec::new();
+        };
+
+        let mut conflicts = self
+            .fixture_system
+            .library
+            .patches
+            .iter()
+            .filter(|other| other.id != patch.id && other.universe == patch.universe)
+            .filter_map(|other| {
+                let (other_start, other_end) = self.fixture_patch_range(other)?;
+                ranges_overlap(start, end, other_start, other_end).then_some(other.id)
+            })
+            .collect::<Vec<_>>();
+        conflicts.sort_unstable();
+        conflicts
+    }
+
+    pub fn fixture_patches_for_group(&self, group_id: FixtureGroupId) -> Vec<&FixturePatch> {
+        let mut patches = self
+            .fixture_system
+            .library
+            .patches
+            .iter()
+            .filter(|patch| patch.group_id == Some(group_id))
+            .collect::<Vec<_>>();
+        patches.sort_by_key(|patch| (patch.universe, patch.address, patch.id));
+        patches
+    }
+
+    pub fn fixture_group_patch_summary(
+        &self,
+        group_id: FixtureGroupId,
+    ) -> FixtureGroupPatchSummary {
+        let patches = self.fixture_patches_for_group(group_id);
+        let mut universes = patches
+            .iter()
+            .map(|patch| patch.universe)
+            .collect::<Vec<_>>();
+        universes.sort_unstable();
+        universes.dedup();
+
+        let mut conflicting_patch_ids = patches
+            .iter()
+            .flat_map(|patch| {
+                let mut ids = self.fixture_patch_conflicts(patch.id);
+                if !ids.is_empty() {
+                    ids.push(patch.id);
+                }
+                ids
+            })
+            .collect::<Vec<_>>();
+        conflicting_patch_ids.sort_unstable();
+        conflicting_patch_ids.dedup();
+
+        let footprint_channels = patches
+            .iter()
+            .filter_map(|patch| self.fixture_patch_channel_count(patch))
+            .sum::<u16>();
+
+        let occupied_channels = patches
+            .iter()
+            .filter_map(|patch| {
+                self.fixture_patch_range(patch)
+                    .map(|(start, end)| (patch.universe, start, end))
+            })
+            .flat_map(|(universe, start, end)| {
+                (start..=end).map(move |channel| (universe, channel))
+            })
+            .fold(Vec::<(u16, u16)>::new(), |mut acc, slot| {
+                if !acc.contains(&slot) {
+                    acc.push(slot);
+                }
+                acc
+            })
+            .len() as u16;
+
+        FixtureGroupPatchSummary {
+            group_id,
+            patch_count: patches.len(),
+            enabled_patch_count: patches.iter().filter(|patch| patch.enabled).count(),
+            footprint_channels,
+            occupied_channels,
+            universes,
+            conflicting_patch_ids,
+        }
+    }
+
+    pub fn fixture_universe_summaries(&self) -> Vec<FixtureUniverseSummary> {
+        let mut universes = self
+            .fixture_system
+            .library
+            .patches
+            .iter()
+            .map(|patch| patch.universe)
+            .collect::<Vec<_>>();
+        universes.sort_unstable();
+        universes.dedup();
+
+        universes
+            .into_iter()
+            .map(|universe| {
+                let patches = self
+                    .fixture_system
+                    .library
+                    .patches
+                    .iter()
+                    .filter(|patch| patch.universe == universe)
+                    .collect::<Vec<_>>();
+
+                let mut occupied = [false; 512];
+                let mut highest_address = 0u16;
+                let mut conflicting_patch_ids = Vec::new();
+                let mut footprint_channels = 0u16;
+
+                for patch in &patches {
+                    if let Some(count) = self.fixture_patch_channel_count(patch) {
+                        footprint_channels = footprint_channels.saturating_add(count);
+                    }
+
+                    if let Some((start, end)) = self.fixture_patch_range(patch) {
+                        highest_address = highest_address.max(end.min(512));
+                        for channel in start..=end.min(512) {
+                            occupied[(channel - 1) as usize] = true;
+                        }
+                    }
+
+                    let conflicts = self.fixture_patch_conflicts(patch.id);
+                    if !conflicts.is_empty() {
+                        conflicting_patch_ids.push(patch.id);
+                        conflicting_patch_ids.extend(conflicts);
+                    }
+                }
+
+                conflicting_patch_ids.sort_unstable();
+                conflicting_patch_ids.dedup();
+
+                FixtureUniverseSummary {
+                    universe,
+                    patch_count: patches.len(),
+                    enabled_patch_count: patches.iter().filter(|patch| patch.enabled).count(),
+                    footprint_channels,
+                    occupied_channels: occupied.iter().filter(|occupied| **occupied).count() as u16,
+                    highest_address,
+                    conflicting_patch_ids,
+                }
+            })
+            .collect()
+    }
+
+    pub fn next_fixture_patch_placement(
+        &self,
+        profile: &FixtureProfile,
+        mode_name: &str,
+    ) -> (u16, u16) {
+        let footprint = fixture_mode_channel_count(profile, mode_name);
+        let footprint = u16::try_from(footprint).unwrap_or(0);
+
+        if footprint == 0 {
+            return (1, 1);
+        }
+
+        for universe in 1..=64 {
+            let mut spans = self
+                .fixture_system
+                .library
+                .patches
+                .iter()
+                .filter(|patch| patch.universe == universe)
+                .filter_map(|patch| self.fixture_patch_range(patch))
+                .collect::<Vec<_>>();
+            spans.sort_unstable_by_key(|(start, end)| (*start, *end));
+
+            let mut next_address = 1u16;
+            for (start, end) in spans {
+                let required_end = next_address.saturating_add(footprint.saturating_sub(1));
+                if required_end < start {
+                    return (universe, next_address);
+                }
+                next_address = next_address.max(end.saturating_add(1));
+            }
+
+            let required_end = next_address.saturating_add(footprint.saturating_sub(1));
+            if next_address >= 1 && required_end <= 512 {
+                return (universe, next_address);
+            }
+        }
+
+        (64, 1)
+    }
+
+    pub fn next_fixture_patch_id(&self) -> u32 {
+        self.fixture_system
+            .library
+            .patches
+            .iter()
+            .map(|patch| patch.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
+    pub fn can_import_fixture_from_ofl(&self) -> bool {
+        !self
+            .fixture_system
+            .library
+            .ofl_manufacturer_key
+            .trim()
+            .is_empty()
+            && !self
+                .fixture_system
+                .library
+                .ofl_fixture_key
+                .trim()
+                .is_empty()
+    }
+
+    pub fn can_import_fixture_from_qxf(&self) -> bool {
+        !self
+            .fixture_system
+            .library
+            .qxf_import_path
+            .trim()
+            .is_empty()
+    }
+
+    pub fn can_export_selected_fixture_profile(&self) -> bool {
+        self.selected_fixture_profile().is_some()
+            && !self
+                .fixture_system
+                .library
+                .qxf_export_path
+                .trim()
+                .is_empty()
+    }
+
+    pub fn can_delete_selected_fixture_profile(&self) -> bool {
+        self.selected_fixture_profile().is_some()
+    }
+
+    pub fn can_create_fixture_patch(&self) -> bool {
+        self.selected_fixture_profile()
+            .is_some_and(|profile| !profile.modes.is_empty())
+    }
+
+    pub fn can_delete_selected_fixture_patch(&self) -> bool {
+        self.selected_fixture_patch().is_some()
+    }
+
+    pub fn selected_dmx_interface(&self) -> Option<&DmxInterfaceDescriptor> {
+        let selected = self.settings.dmx.selected_interface.as_deref()?;
+        self.settings
+            .dmx
+            .interfaces
+            .iter()
+            .find(|interface| interface.id == selected)
+    }
+
+    pub fn selected_midi_input(&self) -> Option<&MidiPortDescriptor> {
+        let selected = self.settings.midi.selected_input.as_deref()?;
+        self.settings
+            .midi
+            .inputs
+            .iter()
+            .find(|port| port.id == selected)
+    }
+
+    pub fn selected_midi_output(&self) -> Option<&MidiPortDescriptor> {
+        let selected = self.settings.midi.selected_output.as_deref()?;
+        self.settings
+            .midi
+            .outputs
+            .iter()
+            .find(|port| port.id == selected)
+    }
+
+    pub fn selected_engine_device(&self) -> Option<&EnginePrimeDevice> {
+        let selected = self.settings.engine_link.selected_device.as_deref()?;
+        self.settings
+            .engine_link
+            .devices
+            .iter()
+            .find(|device| device.id == selected)
+    }
+
+    pub fn next_midi_binding_id(&self) -> u32 {
+        self.settings
+            .midi
+            .bindings
+            .iter()
+            .map(|binding| binding.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
+    pub fn midi_binding(&self, binding_id: u32) -> Option<&MidiBinding> {
+        self.settings
+            .midi
+            .bindings
+            .iter()
+            .find(|binding| binding.id == binding_id)
+    }
+
+    pub fn selected_controller_profile(&self) -> Option<ControllerProfileKind> {
+        self.settings.midi.detected_controller.or_else(|| {
+            self.selected_midi_input()
+                .and_then(|port| port.profile_hint)
+        })
+    }
+
+    pub fn can_apply_controller_automap(&self) -> bool {
+        self.selected_midi_input().is_some() && self.selected_controller_profile().is_some()
+    }
+
+    pub fn can_refresh_hardware_inventory(&self) -> bool {
+        !matches!(self.settings.dmx.phase, HardwareDiscoveryPhase::Refreshing)
+            && !matches!(self.settings.midi.phase, HardwareDiscoveryPhase::Refreshing)
+    }
+
+    pub fn can_refresh_engine_link_discovery(&self) -> bool {
+        self.settings.engine_link.enabled
+            && !matches!(
+                self.settings.engine_link.phase,
+                EngineLinkPhase::Discovering
+            )
+    }
+
+    pub fn should_subscribe_engine_link(&self) -> bool {
+        self.settings.engine_link.enabled
+            && !matches!(self.settings.engine_link.mode, EngineLinkMode::Disabled)
+    }
+
+    pub fn should_dispatch_runtime_outputs(&self) -> bool {
+        let dmx_enabled = self.settings.dmx.output_enabled
+            && !matches!(self.settings.dmx.backend, DmxBackendKind::Disabled);
+        let midi_feedback_enabled = self.settings.midi.feedback_enabled
+            && self.selected_midi_output().is_some()
+            && self
+                .settings
+                .midi
+                .bindings
+                .iter()
+                .any(|binding| binding.message.is_some());
+
+        (dmx_enabled || midi_feedback_enabled)
+            && self.output.phase != OutputDeliveryPhase::Dispatching
+    }
+
+    fn fixture_patch_range(&self, patch: &FixturePatch) -> Option<(u16, u16)> {
+        if !(1..=512).contains(&patch.address) {
+            return None;
+        }
+        let count = self.fixture_patch_channel_count(patch)?;
+        (count > 0).then_some((patch.address, patch.address.saturating_add(count - 1)))
+    }
+
     pub fn selected_summary(&self) -> String {
         if self.timeline.selected_clips.len() > 1 {
             return format!("Clips: {} selektiert", self.timeline.selected_clips.len());
@@ -1193,6 +2162,7 @@ impl StudioState {
             chase_system: self.chase_system.clone(),
             fx_system: self.fx_system.clone(),
             fixture_system: self.fixture_system.clone(),
+            settings: self.settings.clone(),
         })
         .expect("serialize authoring fingerprint")
     }
@@ -1259,6 +2229,10 @@ impl StudioState {
             Some(ContextMenuTarget::Timeline) | None => None,
         }
     }
+}
+
+fn ranges_overlap(start: u16, end: u16, other_start: u16, other_end: u16) -> bool {
+    start <= other_end && other_start <= end
 }
 
 impl EngineState {
